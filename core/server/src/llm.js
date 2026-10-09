@@ -344,6 +344,29 @@ export function faultAdvice(err) {
 /** 我们会往请求体里塞的生成参数，按「被拒了就脱掉」的顺序列。 */
 const TUNABLE_FIELDS = ["temperature", "top_p", "frequency_penalty", "presence_penalty"];
 
+// 已确认不接受自定义采样参数的 Claude 型号。兼容官方 ID、点号别名、日期后缀。
+// 不按“所有新模型”猜能力，未列出的型号仍先用预设，收到明确拒绝才回退。
+const CLAUDE_FIXED_SAMPLING = /(?:^|[^a-z0-9])(?:claude[-_/. ]*)?(?:haiku[-_/. ]*5[-_. ]*5|sonnet[-_/. ]*5(?:[-_. ]*5)?|opus[-_/. ]*(?:4[-_. ]*[78]|5(?:[-_. ]*5)?)|(?:fable|mythos)[-_/. ]*(?:5(?:[-_. ]*1)?|preview))(?=$|[^a-z0-9.])/i;
+
+// 只缓存运行期观察到的能力，不写角色/预设，不按 API Key 分组，不持久化。
+// 地址、协议、模型三个都一致才复用，避免某家中转不收参数影响另一家。
+const rejectedSampling = new Map();
+const SAMPLING_CACHE_LIMIT = 128;
+function samplingKey(type, base, model) {
+  return JSON.stringify([type, base, model]);
+}
+function rememberRejectedSampling(key, field) {
+  let fields = rejectedSampling.get(key);
+  if (!fields) {
+    if (rejectedSampling.size >= SAMPLING_CACHE_LIMIT) {
+      rejectedSampling.delete(rejectedSampling.keys().next().value);
+    }
+    fields = new Set();
+    rejectedSampling.set(key, fields);
+  }
+  fields.add(field);
+}
+
 /**
  * 上游是不是在说「你发的某个生成参数我不收」，是的话返回那个字段名。
  *
@@ -362,10 +385,10 @@ const TUNABLE_FIELDS = ["temperature", "top_p", "frequency_penalty", "presence_p
  * 就把哪个字段脱掉重打一次，脱到能过为止。管你是今天的哪家、明天的哪个。
  */
 function rejectedParamField(status, text) {
-  if (status !== 400) return null;
+  if (status !== 400 && status !== 422) return null;
   const s = String(text ?? "");
   // 先确认这是一句「不支持」，免得把正文里碰巧出现 temperature 的错误也算上
-  if (!/unsupported|not support|unrecognized|invalid[_ ]?(value|parameter|argument)/i.test(s)) {
+  if (!/unsupported|not support|unrecognized|invalid[_ ]?(value|parameter|argument)|not (?:allowed|permitted|accepted)|non[- ]default|only (?:the )?default|extra (?:fields|inputs)|does not accept/i.test(s)) {
     return null;
   }
   return TUNABLE_FIELDS.find((f) => new RegExp(`\\b${f}\\b`, "i").test(s)) ?? null;
@@ -966,6 +989,18 @@ async function chatRaw(endpoint, messages, opts = {}) {
   if (typeof p.topP === "number") body.top_p = p.topP;
   if (typeof p.frequencyPenalty === "number") body.frequency_penalty = p.frequencyPenalty;
   if (typeof p.presencePenalty === "number") body.presence_penalty = p.presencePenalty;
+  const capabilityKey = samplingKey(type, base, model);
+  const omitted = new Set(rejectedSampling.get(capabilityKey) ?? []);
+  if (CLAUDE_FIXED_SAMPLING.test(model)) {
+    omitted.add("temperature");
+    omitted.add("top_p");
+  }
+  for (const field of omitted) {
+    if (body[field] !== undefined) {
+      delete body[field];
+      logDebug(label, `${model} 不支持自定义 ${field}，本次请求省略（预设保留）`);
+    }
+  }
   if (strict) {
     logDebug(label, `${model} 不收生成参数，这轮温度 / Top P / 两个惩罚项都不发`);
   }
@@ -1134,6 +1169,7 @@ async function chatRaw(endpoint, messages, opts = {}) {
     const dropped = rejectedParamField(result.status, result.text);
     if (dropped && body[dropped] !== undefined) {
       delete body[dropped];
+      rememberRejectedSampling(capabilityKey, dropped);
       logWarn(label, `${model} 不收 ${dropped}，去掉这个参数重打一次`, why);
       continue;
     }
