@@ -1,4 +1,5 @@
 import { readBytes, settleWithin } from "./attachread.js";
+import { DATA_DIR, readJson, writeJson } from "./datadir.js";
 import {
   cardHintFor,
   embeddedKindOf,
@@ -6544,6 +6545,68 @@ function syncWatchers(getConfig, runner) {
 }
 
 /* ================= 位置推送 ================= */
+
+/** iPhone 到达/离开自动化：只投递给已建立的单聊，不接受外部指定任意收件人。 */
+export async function triggerLocationEvent(getConfig, input) {
+  const event = String(input?.event ?? "").trim().toLowerCase();
+  const place = String(input?.place ?? "").trim();
+  const projectId = String(input?.projectId ?? "").trim();
+  if (!['arrive', 'leave'].includes(event) || !place || place.length > 100 || /[\r\n]/.test(place)) {
+    return { status: 400, body: { ok: false, error: "event must be arrive or leave; place must be 1-100 characters" } };
+  }
+  const config = getConfig();
+  const candidates = [...runners.values()].filter((r) =>
+    !r.stopped && r.status === "connected" && currentRole(config, r) &&
+    (!projectId || r.projectRefId === projectId)
+  );
+  if (candidates.length !== 1) {
+    return { status: 409, body: { ok: false, error: candidates.length ? "Multiple connections: specify projectId" : "No connected role: check the backend connection" } };
+  }
+  const runner = candidates[0];
+  const role = currentRole(config, runner);
+  const peers = locPeersOf(runner, role);
+  if (peers.size !== 1) {
+    return { status: 409, body: { ok: false, error: "Send a direct iMessage to this role first; a unique chat partner is required" } };
+  }
+  const key = [...peers][0];
+  const last = runner.lastSpace;
+  const same = Boolean(last?.space) && !String(last.spaceId ?? "").includes(";+;") && peerKeyOf(last.peer) === key;
+  const storedPeer = readSession(sessionIdOf(runner, role, "")).peer;
+  const peer = same ? last.peer : storedPeer;
+  if (!peer || peerKeyOf(peer) !== key) {
+    return { status: 409, body: { ok: false, error: "Send a direct iMessage to this role first" } };
+  }
+  const spaceId = same ? last.spaceId : `any;-;${peer}`;
+  let out = { status: 503, body: { ok: false, error: "Could not queue location event" } };
+  await chain(runner, spaceId, async () => {
+    const fresh = currentRole(getConfig(), runner);
+    if (runner.stopped || !fresh || fresh.id !== role.id) return;
+    if (isAssistOn(runner.projectRefId, spaceId) || isOfflineOn(memoryKeyFor(fresh))) {
+      out = { status: 200, body: { ok: true, status: "skipped", reason: "assist_or_offline_mode" } };
+      return;
+    }
+    // 同一地点两分钟内连续重复上报就忽略；中间有相反事件时仍可触发真实往返。
+    // 写入现有数据目录，Worker 重启后仍保留；只存事件标识和时间，不存坐标。
+    const statePath = `${DATA_DIR}/geofence-events.json`;
+    const rows = readJson(statePath, []);
+    const recent = Array.isArray(rows) ? rows.filter((r) => r && Date.now() - r.at < 120000) : [];
+    const id = JSON.stringify([runner.projectRefId, fresh.id, key, place]);
+    if (recent.findLast((r) => r.id === id)?.event === event) {
+      out = { status: 200, body: { ok: true, status: "duplicate" } };
+      return;
+    }
+    const space = same ? last.space : await spaceForChat(runner, spaceId);
+    if (!space || runner.stopped) return;
+    const hint = `[Location event: {{user}} has just ${event === "arrive" ? "arrived at" : "left"} ${JSON.stringify(place)}. ` +
+      `This is an automatic phone notification, not a message typed by {{user}}. ` +
+      `Respond naturally in character using your usual language and chat style. Do not mention the automation or claim to see anything beyond this event.]`;
+    writeJson(statePath, [...recent, { id, event, at: Date.now() }].slice(-100));
+    enqueue(getConfig, runner, space, spaceId, { text: hint }, peer);
+    logInfo(scopeOf(runner, "地点事件"), `${event}: ${place} 已加入聊天队列`);
+    out = { status: 202, body: { ok: true, status: "queued", event, place } };
+  }, "地点事件处理失败");
+  return out;
+}
 
 /**
  * 让位置推送的定时器对齐当前配置：开了没起就起，关了就停，

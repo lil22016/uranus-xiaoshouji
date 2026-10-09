@@ -46,6 +46,7 @@ import {
   getStatus,
   forgetHistory,
   igSessionFor,
+  triggerLocationEvent,
 } from "./imessage.js";
 import { getLastPrompt } from "./lastprompt.js";
 import {
@@ -462,6 +463,25 @@ app.use((req, res, next) => {
 });
 
 /* ================= 登录闸门 ================= */
+
+// iPhone 地点自动化不具备控制台登录态，使用现有查岗校验密钥。
+// 独立路径避免把自动事件投给等待位置查询结果的队列；必须挂在登录闸门之前。
+app.post("/phone/geofence", express.raw({ type: "*/*", limit: "16kb" }), async (req, res) => {
+  const parsed = parseDataUpload(req.body, req.headers["content-type"]);
+  const want = String(loadConfig()?.spyApi?.webhookSecret ?? "");
+  const secret = parsed.secret || String(req.headers["x-spy-secret"] ?? "");
+  if (!want || secret !== want) return res.status(403).json({ ok: false, error: "Invalid phone verification secret" });
+  let input;
+  try { input = JSON.parse(parsed.data); }
+  catch { return res.status(400).json({ ok: false, error: "Invalid JSON" }); }
+  try {
+    const out = await triggerLocationEvent(loadConfig, input);
+    res.status(out.status).json(out.body);
+  } catch (e) {
+    logError("地点事件", "处理失败", e);
+    res.status(500).json({ ok: false, error: "Location event failed; check backend logs" });
+  }
+});
 
 /**
  * 不需要登录就能打的口子。
