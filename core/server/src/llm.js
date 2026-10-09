@@ -930,6 +930,28 @@ async function chatRaw(endpoint, messages, opts = {}) {
 
   const body = { model, messages: strict ? moveModelTail(messages, label) : messages };
 
+  // DeepSeek 的原生 Chat Completions 参数，不是提示词，也不是隐藏思考文本。
+  // 官方地址可以识别别名；中转只匹配已知支持双模式的模型名，避免给 R1 / Distill
+  // 或其他服务商发送它。false / 0 / off 恢复本项目原来的请求，不强制启用思考。
+  let officialDeepSeek = false;
+  try {
+    officialDeepSeek = new URL(base).hostname.toLowerCase() === "api.deepseek.com";
+  } catch {
+    // 非法地址仍交给原来的请求错误处理。
+  }
+  const dualModeDeepSeek = /^deepseek-(?:chat|reasoner|flash|v4-(?:flash|pro)|v3[._-][12])$/i.test(model);
+  const nonThinking = !/^(?:false|0|off)$/i.test(
+    String(process.env.URANUS_DEEPSEEK_NON_THINKING ?? "true").trim()
+  );
+  if (
+    nonThinking &&
+    (type === "custom" || type === "openai") &&
+    (officialDeepSeek || dualModeDeepSeek)
+  ) {
+    body.thinking = { type: "disabled" };
+    logDebug(label, `${model} 已请求 DeepSeek non-thinking 模式`);
+  }
+
   /*
    * 生成参数。逐个判 typeof 再发，而不是一股脑塞进去 ——
    * 有些中转站对 top_p / penalty 这些字段挑食，没配的就别发。

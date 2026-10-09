@@ -68,6 +68,8 @@ export class Uranus extends DurableObject {
       PORT: String(PORT),
       URANUS_IG_PORT: "off",
       URANUS_WORKER: "1",
+      // 控制台没有思考模式开关：默认关闭 DeepSeek 思考；false 恢复上游默认。
+      URANUS_DEEPSEEK_NON_THINKING: String(this.env.URANUS_DEEPSEEK_NON_THINKING ?? "true"),
       TZ: process.env.TZ || this.env.TZ || "Asia/Shanghai",
     });
     installTimeZone(process.env.TZ);
