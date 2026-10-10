@@ -309,6 +309,16 @@ function existingNote(apps, state) {
 
 const DAY_MS = 86400000;
 
+// Language applies only to generated phone content, not the control-panel UI
+// or the JSON schema consumed by the existing frontend.
+export const PHONE_OUTPUT_LANGUAGE_PROMPT =
+  "Output language: English. Write all newly generated user-visible phone content in natural English, " +
+  "including titles, message and email text, notes, searches, descriptions and human-readable time labels. " +
+  "Use English even when the instructions, character profile, memories or existing phone entries are in Chinese. " +
+  "Preserve established proper names, usernames, phone numbers, URLs, product identifiers and currency symbols. " +
+  "Keep the required JSON keys and App IDs exactly unchanged; do not translate schema keys or add commentary. " +
+  "Keep the character's personality and relationships consistent. Generate only the requested JSON.";
+
 /**
  * 记忆库那三样，各自跟着这个角色的开关走：
  *  - 记忆：只取「记忆库 → 设置 → 注入近 N 天的记忆」那个 N 天里的（不做语义检索）
@@ -396,6 +406,7 @@ function buildMessages(config, role, apps, bookIds, mode = "append") {
     user?.description ? `<${userName}的人设>\n${fill(user.description)}\n</${userName}的人设>` : "",
     world ? `<世界设定>\n${world}\n</世界设定>` : "",
     fill(memory),
+    PHONE_OUTPUT_LANGUAGE_PROMPT,
   ]
     .filter(Boolean)
     .join("\n\n");
@@ -419,6 +430,7 @@ function buildMessages(config, role, apps, bookIds, mode = "append") {
       "只输出一个 JSON 对象，不要解释、不要代码块以外的文字。",
       `键是上面的 App id，值是记录数组，每条 {"title": "…", "detail": "…", "value": "…", "time": "…"}，四个字段都是字符串。`,
       apps.some((a) => a.id === "wallet") ? `另外加一个键 "walletBalance"，值是钱包余额（如 "¥3,281.40"）。` : "",
+      PHONE_OUTPUT_LANGUAGE_PROMPT,
     ].join(""),
   ]
     .filter(Boolean)
