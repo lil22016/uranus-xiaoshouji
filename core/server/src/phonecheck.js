@@ -292,8 +292,8 @@ function recentChat(config, role, user) {
 const sameDay = (a, b) => new Date(a).toDateString() === new Date(b).toDateString();
 
 /**
- * 继续生成时给模型看的「手机里已经有的」：每个 App 最近几条的标题。
- * 只给标题和一点点值，不给正文 —— 够它别写重复、接得上，又不至于把提示词撑大。
+ * 给模型看所有仍保留的条目。重复标题类 App 不需要正文；聊天、电话等
+ * 允许同一联系人继续出现，带一点正文帮助模型区分旧事件和新事件。
  */
 function existingNote(apps, state) {
   const lines = [];
@@ -301,8 +301,11 @@ function existingNote(apps, state) {
     let list = state.apps[a.id] ?? [];
     if (a.id === "track") list = list.filter((x) => sameDay(x.at, Date.now()));
     if (!list.length) continue;
-    const shown = list.slice(0, a.id === "track" ? 12 : 8).map((x) => x.title + (x.value ? `（${x.value}）` : ""));
-    lines.push(`- ${a.id}（${a.name}）：${shown.join("；")}`);
+    const shown = list.slice(0, KEEP_PER_APP).map((x) => ({
+      title: x.title, value: x.value, time: x.time,
+      ...(requiresNewTitle(a.id) ? {} : { detail: String(x.detail ?? "").slice(0, 160) }),
+    }));
+    lines.push(`- ${a.id}（${a.name}）：${JSON.stringify(shown)}`);
   }
   return lines.join("\n");
 }
@@ -360,7 +363,7 @@ function memoryBlock(config, role) {
  * @param {"append"|"reset"} mode append = 在原来的手机上接着加（模型能看到已有的条目）；
  *        reset = 当这台手机是全新的，不给它看旧内容
  */
-function buildMessages(config, role, apps, bookIds, mode = "append") {
+function buildMessages(config, role, apps, bookIds, mode = "append", previousState = null) {
   const user = resolveUser(config, role);
   const vars = { char: role.name ?? "", user: user?.name ?? "" };
   const fill = (t) => applyVars(String(t ?? ""), vars).trim();
@@ -387,7 +390,7 @@ function buildMessages(config, role, apps, bookIds, mode = "append") {
   const others = (config.roles ?? [])
     .filter((r) => r.id !== role.id && r.name)
     .map((r) => `- ${r.name}：${fill(r.description).replace(/\s+/g, " ").slice(0, 80) || "（没有人设）"}`);
-  const state = loadState(role.id);
+  const state = previousState ?? loadState(role.id);
   const fresh = mode === "reset";
   const known = fresh ? [] : (state.apps.contacts ?? []).slice(0, 15).map((c) => `${c.title}（${c.value || "—"}）`);
   const existing = fresh ? "" : existingNote(apps, state);
@@ -419,6 +422,7 @@ function buildMessages(config, role, apps, bookIds, mode = "append") {
     existing
       ? `<手机里已经有的（这次是接着往下加新的，别重复这些；时间往后走，情节能接上就接上，活动轨迹从最后一站接着走）>\n${existing}\n</手机里已经有的>`
       : "",
+    fresh ? "" : PHONE_APPEND_PROMPT,
     [
       "视角：这些全是**你自己**的生活和社交，用你的第一人称视角写；",
       `${vars.user || "用户"}正在翻看你的手机，TA 不是你通讯录里的路人（要提到 TA 就用你平时对 TA 的称呼）。`,
@@ -464,6 +468,45 @@ export function extractJson(text) {
 
 const asText = (v) =>
   typeof v === "string" ? v.trim() : v == null ? "" : typeof v === "object" ? JSON.stringify(v) : String(v);
+
+// All built-in and custom Apps require fresh titles, except messages/calls:
+// their title identifies a person, so a new conversation may legitimately
+// have the same title. Even those Apps reject an identical complete record.
+const requiresNewTitle = (appId) => appId !== "chat" && appId !== "call";
+const PHONE_APPEND_PROMPT =
+  "Append mode: generate ONLY genuinely new records; do not rewrite or return existing records. " +
+  "This applies to ALL Apps, including shopping, delivery, wallet, browser, incognito, video, files, " +
+  "contacts, activity tracks and custom Apps. Produce new titles and genuinely new underlying content. " +
+  "Do not reuse an old product, restaurant, transaction, search query, video, filename, contact or route " +
+  "and merely change its description, status, price, reason or timestamp. Do not paraphrase old entries " +
+  "to evade this rule. For messages and calls ONLY, an existing contact name may recur, but the actual " +
+  "conversation or call must be genuinely new. Never modify existing records.";
+
+// Case, Unicode width, extra spaces and trailing sentence punctuation do not
+// make a new title. Preserve meaningful symbols, e.g. C++ versus C#.
+const normalizedTitle = (value) => asText(value).normalize("NFKC").toLowerCase()
+  .replace(/\s+/gu, " ").replace(/[.!?。！？]+$/u, "").trim();
+const normalizedField = (value) => asText(value).normalize("NFKC").toLowerCase().replace(/\s+/gu, " ");
+function recordKey(appId, item) {
+  return requiresNewTitle(appId)
+    ? normalizedTitle(item.title)
+    : JSON.stringify([item.title, item.detail, item.value, item.time].map(normalizedField));
+}
+
+/** Filter both existing records and duplicates within this generation. */
+export function filterNewPhoneItems(appId, candidates, existing = []) {
+  const seen = new Set(existing.map((x) => recordKey(appId, x)));
+  const items = [];
+  let duplicates = 0;
+  for (const item of candidates) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const key = recordKey(appId, item);
+    if (seen.has(key)) { duplicates += 1; continue; }
+    seen.add(key);
+    items.push(item);
+  }
+  return { items, duplicates };
+}
 
 /** 角色自己的模型（失败退副 API），或者设置里单独选的那个。 */
 async function callModel(config, role, messages) {
@@ -559,6 +602,48 @@ export async function runGenerate(config, role, appIds, opts = {}) {
   const json = extractJson(reply);
   if (!json) throw new Error(`模型回的不是 JSON，没法解析：${String(reply).slice(0, 120)}`);
 
+  const accepted = {};
+  const retryApps = [];
+  const needs = {};
+  for (const app of apps) {
+    const raw = Array.isArray(json[app.id]) ? json[app.id] : [];
+    const existing = reset ? [] : (state.apps[app.id] ?? [])
+      .filter((x) => app.id !== "track" || sameDay(x.at, Date.now()));
+    const filtered = filterNewPhoneItems(app.id, raw, existing);
+    accepted[app.id] = filtered.items;
+    if (!reset && filtered.duplicates) {
+      logWarn(SCOPE, `${app.name}过滤了 ${filtered.duplicates} 条重复记录`);
+      const need = Math.min(raw.length, config.phone?.count ?? 4) - filtered.items.length;
+      if (need > 0) { retryApps.push(app); needs[app.id] = need; }
+    }
+  }
+
+  // At most one supplement request. Nothing is written until usable new rows
+  // exist, and partial new results survive a failed supplement request.
+  if (retryApps.length) {
+    const retryState = { ...state, apps: { ...state.apps } };
+    for (const app of retryApps) retryState.apps[app.id] = [...accepted[app.id], ...(state.apps[app.id] ?? [])];
+    const messages = buildMessages(config, role, retryApps, bookIds, "append", retryState);
+    messages.push({ role: "user", content:
+      "Some candidates repeated existing records and were rejected. Generate only the missing new records: " +
+      JSON.stringify(needs) + ". For every App except messages and calls, do not repeat any listed title. " +
+      "Changing only a description or timestamp is not sufficient. Return only the required JSON object. " +
+      PHONE_OUTPUT_LANGUAGE_PROMPT,
+    });
+    try {
+      const supplement = extractJson(await callModel(config, role, messages));
+      if (!supplement) throw new Error("补生成的内容不是 JSON");
+      for (const app of retryApps) {
+        const raw = Array.isArray(supplement[app.id]) ? supplement[app.id] : [];
+        const filtered = filterNewPhoneItems(app.id, raw, retryState.apps[app.id]);
+        accepted[app.id].push(...filtered.items.slice(0, needs[app.id]));
+        if (filtered.duplicates) logWarn(SCOPE, `${app.name}补生成仍有 ${filtered.duplicates} 条重复，已过滤`);
+      }
+    } catch (e) {
+      logWarn(SCOPE, "去重后的补生成没完成，保留本轮已经生成的新记录", String(e?.message ?? e));
+    }
+  }
+
   const otherNames = new Set((config.roles ?? []).filter((r) => r.id !== role.id).map((r) => r.name?.trim()).filter(Boolean));
   const now = Date.now();
   const batch = {};
@@ -572,7 +657,7 @@ export async function runGenerate(config, role, appIds, opts = {}) {
     state.walletBalance = "";
   }
   for (const app of apps) {
-    const raw = Array.isArray(json[app.id]) ? json[app.id] : [];
+    const raw = accepted[app.id] ?? [];
     const items = raw
       .filter((x) => x && typeof x === "object")
       .map((x) => ({
@@ -597,7 +682,7 @@ export async function runGenerate(config, role, appIds, opts = {}) {
     state.updatedAt[app.id] = now;
   }
   if (json.walletBalance) state.walletBalance = asText(json.walletBalance);
-  if (!Object.keys(batch).length) throw new Error("模型回了 JSON，但里面一条能用的记录都没有");
+  if (!Object.keys(batch).length) throw new Error("模型没有生成可用的新记录（可能重复了旧内容）。原有手机记录已保留，请再试一次。");
   // ↑ 这一句在 reset 清空 state 之后，但 state 还没落盘 —— 抛出去旧文件照样完好
 
   state.bookIds = bookIds;
