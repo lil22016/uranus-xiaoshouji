@@ -45,9 +45,21 @@ import {
   stopAllBridges,
   getStatus,
   forgetHistory,
+  handleDollPush,
   igSessionFor,
   triggerLocationEvent,
 } from "./imessage.js";
+import {
+  buildDollExperiment,
+  calibrateDoll,
+  DOLL_PUSH_PATH,
+  fetchDollConfig,
+  fetchDollSamples,
+  guessDollBuffers,
+  parseDollPush,
+  suggestThresholds,
+  summarizeCalib,
+} from "./doll.js";
 import { getLastPrompt } from "./lastprompt.js";
 import {
   BATTERY_PATH,
@@ -724,6 +736,340 @@ function attach(res, name, type = "application/json; charset=utf-8") {
     `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`
   );
 }
+
+/**
+ * 共感娃娃的**推送**入口：手机上那个实验自己把一包样本 POST 过来。
+ *
+ * ── 为什么不在 /api 下、也不走控制台登录 ──
+ *
+ * 和 spyphone.js 那两条回传路径一个道理：phyphox 的网络连接带不了控制台的
+ * 会话 cookie，也**不支持自定义请求头**，能带出去的只有 URL。所以这条路只能
+ * 用一个预共享的 secret 认，而且它得在 `/api` 之外（那下面整片都挡着登录）。
+ *
+ * **没配 secret 就一律 404**，不是 403 —— 对着公网开一个「谁都能让角色以为
+ * 被抱了」的口子是不行的，而回 404 连「这儿有个功能」都不告诉扫端口的人。
+ *
+ * 路径写死不跟着配置走：这个地址要抄进手机上的实验文件里（其实是我们生成的），
+ * 少一处能填错的地方。
+ */
+/**
+ * 同一个推送地址，用**浏览器**打开时的样子 —— 给人排查用的。
+ *
+ * phyphox 发的是 POST，浏览器地址栏只能发 GET，所以以前把实验文件里那个地址
+ * 贴进手机浏览器只会看到一个光秃秃的 404，什么都说明不了。现在 GET 也接，
+ * 回一句人话：
+ *
+ *  - 打不开 → 网络那一段不通（地址、防火墙、IP 白名单）；
+ *  - 「密钥不对」→ 手机上那份实验文件是旧的；
+ *  - 「通了」→ 地址和密钥都没问题，剩下的就是 phyphox 那头（播放键、切后台）。
+ *
+ * 功能没开时照样 404，和 POST 那条一个规矩：不对外承认这儿有东西。
+ */
+app.get(DOLL_PUSH_PATH, (req, res) => {
+  const api = loadConfig()?.dollApi ?? {};
+  const want = String(api.pushSecret ?? "").trim();
+  if (!api.enabled || api.mode !== "push" || !want) return res.status(404).end();
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  const got = String(req.query?.secret ?? "").trim();
+  if (got !== want) {
+    return res
+      .status(403)
+      .send("共感娃娃推送口：地址是通的，但密钥不对。\n手机上那份实验文件是旧的 —— 去控制台重新下载一份装上。");
+  }
+  logInfo("共感娃娃", "有人用浏览器打开了推送地址，地址和密钥都对");
+  res.send(
+    "共感娃娃推送口：通了，地址和密钥都对。\n\n" +
+      "接下来要是还没反应，问题在 phyphox 那头：\n" +
+      "· 打开的是「共感娃娃」这个实验（不是自带的加速度实验）\n" +
+      "· 按了播放键，而且 phyphox 一直开在前台\n" +
+      "· 实验页面底下有没有红色的 error 提示"
+  );
+});
+
+/**
+ * 推送模式下的两步校准。
+ *
+ * 拉模式的校准是后端主动去读手机几秒（calibrateDoll）；推模式下后端联系不上
+ * 手机，只能**截住接下来几秒推过来的数据**。所以这里是一个「录音窗口」：
+ * 面板上点一下开始，推送口收到的样本在窗口期内都抄一份进来，到点算概况。
+ *
+ * `skipFirst`：开窗后到的第一包要丢掉。手机每两秒推一包，那一包里装的是
+ * **开窗之前**那两秒的数据 —— 用户点「抱着」之后才去抱，第一包里多半还是
+ * 放着的样子，混进来会把「抱着」的读数拉低。
+ *
+ * 只在内存里：校准是当场做的事，重启了重做就是。
+ */
+let dollCalib = null; // { kind, until, values:[], skipFirst } | null
+const dollCalibDone = {}; // { still?: summary, hug?: summary }
+
+/** 窗口到点了就收尾。在推送口和查询口两头都调，谁先碰到谁收。 */
+function finishDollCalib() {
+  if (!dollCalib || dollCalib.pull || Date.now() < dollCalib.until) return;
+  const { kind, values } = dollCalib;
+  dollCalibDone[kind] = summarizeCalib(values);
+  dollCalib = null;
+  const r = dollCalibDone[kind];
+  logInfo(
+    "共感娃娃",
+    r.count
+      ? `校准「${kind === "still" ? "放着别动" : "抱着"}」读完了：${r.count} 个样本，最大晃到 ${r.peak}`
+      : `校准「${kind === "still" ? "放着别动" : "抱着"}」这几秒一个样本都没收到（phyphox 在前台开着、点了播放吗？）`
+  );
+}
+
+app.post("/api/doll/calib", (req, res) => {
+  const api = loadConfig()?.dollApi ?? {};
+  if (!api.enabled) {
+    return res.status(400).json({ ok: false, error: "先把「连手机」那个总开关打开" });
+  }
+  const pull = api.mode !== "push";
+  if (pull && (!String(api.host ?? "").trim() || !api.magnitude || !api.time)) {
+    return res.status(400).json({ ok: false, error: "先把手机地址和那两个 buffer 名填上（点一下「测试连接」能自动填）" });
+  }
+  if (dollCalib) return res.status(409).json({ ok: false, error: "上一步还在读，等它读完" });
+
+  const kind = req.body?.kind === "hug" ? "hug" : "still";
+  // 默认 8 秒：推送模式下手机两秒一包，丢掉第一包之后还能收到三包
+  const seconds = Math.min(Math.max(Number(req.body?.seconds) || 8, 3), 20);
+  const label = kind === "still" ? "放着别动" : "抱着";
+  delete dollCalibDone[kind];
+  logInfo("共感娃娃", `开始校准「${label}」，读 ${seconds} 秒`);
+
+  if (!pull) {
+    dollCalib = { kind, until: Date.now() + seconds * 1000, values: [], skipFirst: true };
+    return res.json({ ok: true, kind, seconds });
+  }
+
+  /*
+   * 拉模式（后端去读手机）：后端自己去读这几秒，读完把结果放进同一个地方。
+   *
+   * 后台跑、不让这个请求干等：前端那边和推送模式共用一套「每秒问一次读完没」，
+   * 两种模式长得一样，面板不用分两套。读的办法和以前那个单步校准一样
+   * （calibrateDoll），只是现在拿原始读数去算 p95，而不是让用户自己看峰值均值。
+   */
+  dollCalib = { kind, until: Date.now() + seconds * 1000, pull: true };
+  calibrateDoll(api.host, {
+    magnitude: api.magnitude,
+    time: api.time,
+    cover: api.cover,
+    seconds,
+    intervalMs: api.intervalMs,
+  })
+    .then((r) => {
+      dollCalibDone[kind] = summarizeCalib(r.values);
+      logInfo("共感娃娃", `校准「${label}」读完了：${r.samples} 个样本，最大晃到 ${dollCalibDone[kind].peak}`);
+    })
+    .catch((e) => {
+      const error = String(e?.message ?? e);
+      dollCalibDone[kind] = { count: 0, peak: 0, avg: 0, p90: 0, p95: 0, error };
+      logWarn("共感娃娃", `校准「${label}」没读成：${error}`);
+    })
+    .finally(() => {
+      dollCalib = null;
+    });
+  res.json({ ok: true, kind, seconds });
+});
+
+app.get("/api/doll/calib", (_req, res) => {
+  finishDollCalib();
+  const { still, hug } = dollCalibDone;
+  res.json({
+    ok: true,
+    active: dollCalib
+      ? { kind: dollCalib.kind, left: Math.max(0, Math.ceil((dollCalib.until - Date.now()) / 1000)) }
+      : null,
+    still: still ?? null,
+    hug: hug ?? null,
+    suggestion: still?.count && hug?.count ? suggestThresholds(still, hug) : null,
+  });
+});
+
+/** 「推过来但这边没收」那句话的节流状态，见下面那条路由。 */
+let dollPushQuiet = { why: "", at: 0 };
+
+/**
+ * 最近一次有人打推送口 —— **不管收没收下**。
+ *
+ * 用来判「断了一阵之后又连上来了」，好在控制台报一声「手机连上来了」
+ * （见推送口那条路由）。只在内存里：重启之后本来就该从「还没收到过」重新看起。
+ */
+let lastDollPush = null; // { at, ok, why, samples, hugs } | null
+
+app.post(DOLL_PUSH_PATH, async (req, res) => {
+  const api = loadConfig()?.dollApi ?? {};
+  const want = String(api.pushSecret ?? "").trim();
+  // 一进门就记一笔：收没收下另说，**到没到**本身就是最要紧的那条信息
+  const note = (ok, why = "") => {
+    lastDollPush = { at: Date.now(), ok, why, samples: 0, hugs: 0 };
+    return lastDollPush;
+  };
+  if (!api.enabled || api.mode !== "push" || !want) {
+    /*
+     * 回 404 是故意的（别告诉扫端口的人这儿有东西），但**日志里得说明白**：
+     * 手机那头只看得到一个 404，而 404 既可能是「地址填错了」也可能是
+     * 「功能没开」—— 不说的话用户只能对着一个没有任何线索的错误干瞪眼。
+     *
+     * 节流到一分钟一条：phyphox 是每隔两秒推一次的，不节流会把日志刷没。
+     */
+    const why = !api.enabled
+      ? "「连手机」这个总开关是关的"
+      : api.mode !== "push"
+        ? "现在是「后端去读手机」模式，没在收推送"
+        : "还没生成推送密钥";
+    const now = Date.now();
+    note(false, why);
+    if (now - dollPushQuiet.at > 60_000 || dollPushQuiet.why !== why) {
+      logWarn("共感娃娃", `手机推了一包数据过来，但这边没收：${why}（它那头会显示 404）`);
+      dollPushQuiet = { why, at: now };
+    }
+    return res.status(404).end();
+  }
+
+  // 密钥只能走查询串（phyphox 带不了请求头），但手工测的时候用头更顺手，两样都认
+  const got = String(req.query?.secret ?? req.headers["x-doll-secret"] ?? "").trim();
+  if (got !== want) {
+    note(false, "密钥不对（手机上那份实验文件是不是在改密钥之前下的？）");
+    logWarn("共感娃娃", "有人往推送口打了一包数据，但密钥不对");
+    return res.status(403).json({ ok: false, error: "secret 不对" });
+  }
+
+  let parsed;
+  try {
+    parsed = parseDollPush(req.body);
+  } catch (e) {
+    const error = String(e?.message ?? e);
+    note(false, `数据看不懂：${error}`);
+    logWarn("共感娃娃", `推过来的数据看不懂：${error}`);
+    return res.status(400).json({ ok: false, error });
+  }
+  /*
+   * 断了一阵之后的第一包（或者开机后的第一包）报一声「连上了」。
+   *
+   * 成功的推送以前是**一个字都不打**的（每两秒一包，打了就刷屏）——
+   * 结果「推到了但还没认出拥抱」和「根本没推到」在控制台上一模一样，
+   * 都是一片安静。这一句只在状态变化时说，不刷屏。
+   */
+  // 校准窗口开着就抄一份（见 dollCalib 的注释；开窗后第一包丢掉）
+  finishDollCalib();
+  if (dollCalib && !dollCalib.pull) {
+    if (dollCalib.skipFirst) dollCalib.skipFirst = false;
+    else for (const x of parsed.samples) dollCalib.values.push(x.a);
+  }
+
+  const prev = lastDollPush;
+  if (!prev || !prev.ok || Date.now() - prev.at > 60_000) {
+    logInfo("共感娃娃", `手机连上来了，开始收数据（这一包 ${parsed.samples.length} 个样本）`);
+  }
+  if (!parsed.samples.length) {
+    note(true, "这一包是空的");
+    return res.json({ ok: true, hugs: 0 });
+  }
+
+  /*
+   * 同步跑完、立刻回。**不等递送** —— 那是一整轮模型调用，十几秒，
+   * 而手机每两秒就推一包，吊着不回会让请求在手机那头堆起来，
+   * 然后乱序涌进来（详见 imessage.js:handleDollPush 里那段注释）。
+   */
+  try {
+    const out = handleDollPush(loadConfig, parsed);
+    Object.assign(note(true), { samples: parsed.samples.length, hugs: out.hugs });
+    res.json({ ok: true, ...out });
+  } catch (e) {
+    logError("共感娃娃", "处理推过来的数据时出错", e);
+    res.status(500).json({ ok: false, error: String(e?.message ?? e) });
+  }
+});
+
+/**
+ * 下载给手机装的那个 `.phyphox` 实验文件。
+ *
+ * 为什么由服务端生成：「往外 POST」只能写在实验文件的 `<network>` 块里，而
+ * phyphox 官方的网页编辑器**不支持网络连接**，只能手写 XML。让用户照着 wiki
+ * 自己搓一份、还要把地址和密钥填对，等于劝退。
+ *
+ * **这个文件里带着密钥**，所以它本身就是凭据 —— 面板上那句提示写了别外传。
+ */
+app.get("/api/doll/experiment", (_req, res) => {
+  const api = loadConfig()?.dollApi ?? {};
+  const base = String(api.pushUrl ?? "").trim();
+  const secret = String(api.pushSecret ?? "").trim();
+  if (!base) return res.status(400).json({ ok: false, error: "先填手机要连的那个公网地址" });
+  if (!secret) return res.status(400).json({ ok: false, error: "先生成一个推送密钥" });
+
+  let url;
+  try {
+    const u = new URL(/^https?:\/\//i.test(base) ? base : `http://${base}`);
+    u.pathname = DOLL_PUSH_PATH;
+    u.search = new URLSearchParams({ secret }).toString();
+    url = u.toString();
+  } catch {
+    return res.status(400).json({ ok: false, error: "那个地址看不懂（像 https://chat.example.com 这样填）" });
+  }
+
+  const xml = buildDollExperiment({
+    url,
+    rate: api.pushRate,
+    interval: api.pushInterval,
+    cover: Boolean(String(api.cover ?? "").trim()),
+  });
+  logInfo("共感娃娃", `生成了一份实验文件，手机会推到 ${new URL(url).origin}${DOLL_PUSH_PATH}`);
+  res.setHeader("Content-Type", "application/octet-stream");
+  res.setHeader("Content-Disposition", 'attachment; filename="uranus-hug.phyphox"');
+  res.send(xml);
+});
+
+/**
+ * 共感娃娃：手机上那个 phyphox 连不连得上。
+ *
+ * 回的不只是「通了没通」——**还得把手机上那个实验里的 buffer 名列出来**。
+ * 那几个名字是跟着实验走的（用户换个实验就全变了），而面板上要填的正是它们；
+ * 不列出来的话用户只能在那三个输入框里瞎猜，猜错的表现又是「一直没反应」，
+ * 根本看不出错在哪。
+ *
+ * `host` 从 body 来而不是从配置读：用户填完还没保存就该能测（和
+ * /api/order/test 用 body 里那个 token 一个道理）。
+ */
+app.post("/api/doll/test", async (req, res) => {
+  const host = String(req.body?.host ?? "").trim();
+  if (!host) return res.status(400).json({ ok: false, error: "先填手机上 phyphox 显示的那个地址" });
+  try {
+    const config = await fetchDollConfig(host);
+    const guess = guessDollBuffers(config);
+    /*
+     * 顺手读一次：用户填的那两个 buffer 名到底有没有数。`/config` 里有这个名字
+     * 不代表读得出东西（里面大半是分析中间量），真读一次才算验过。
+     */
+    const magnitude = String(req.body?.magnitude ?? "").trim() || guess.magnitude;
+    const time = String(req.body?.time ?? "").trim() || guess.time;
+    let sample = null;
+    let why = "";
+    if (magnitude && time) {
+      try {
+        const page = await fetchDollSamples(host, {
+          magnitude,
+          time,
+          cover: String(req.body?.cover ?? "").trim(),
+        });
+        sample = {
+          measuring: page.measuring,
+          session: page.session,
+          value: page.samples.length ? page.samples[page.samples.length - 1].a : null,
+          at: page.last,
+          cover: page.cover,
+        };
+      } catch (e) {
+        why = String(e?.message ?? e);
+      }
+    }
+    logInfo("共感娃娃", `连上了手机上的 phyphox：${config.title || "（没名字的实验）"}`);
+    res.json({ ok: true, ...config, guess, sample, sampleError: why });
+  } catch (e) {
+    const error = String(e?.message ?? e);
+    logWarn("共感娃娃", `连不上手机上的 phyphox：${error}`);
+    res.status(400).json({ ok: false, error });
+  }
+});
+
 
 // ---- 配置读写 ----
 app.get("/api/config", (_req, res) => {

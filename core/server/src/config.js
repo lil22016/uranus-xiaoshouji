@@ -1,4 +1,6 @@
 import { clampInt, clampNum, pickId, str } from "./normalize.js";
+import { DOLL_DEFAULTS, HUG_TEMPLATE_RICH, POLL_MAX_MS, POLL_MIN_MS } from "./doll.js";
+import { applyModelDefaults, prepareModelDefaults } from "./modeldefaults.js";
 import {
   CHARACTERS_DIR,
   CONFIG_PATH,
@@ -663,6 +665,58 @@ export const DEFAULT_CONFIG = {
   },
   // 语音合成（TTS）的凭据，同样全局一份（只写 data.config.json）。
   // 四家都没开 = 角色就算打开了「发语音」也发不出来，退化成文字，见 media.js
+  dollApi: {
+    enabled: false,
+    /*
+     * 哪一头主动：
+     *
+     *  - `pull`（默认）：服务端定时去读手机上 phyphox 的远程接口。**要求两边
+     *    在同一个网里**，自己电脑上跑的时候最省事，手机上不用装任何东西。
+     *  - `push`：手机按我们生成的实验文件，自己定时 POST 过来。**服务端在哪
+     *    都行** —— VPS、小手机（Worker）只能走这条。
+     *
+     * 见 doll.js 文件头「两种接法」。
+     */
+    mode: "pull",
+    // 手机上 phyphox 显示的那个地址。安卓一般是 8080，iPhone 默认 80。只有拉模式用
+    host: "",
+    /*
+     * 推模式这三样：手机要打到哪个公网地址、凭什么证明是它、多久推一次。
+     *
+     * `pushUrl` 只填到域名/端口（比如 `https://chat.example.com`），路径由
+     * doll.js:DOLL_PUSH_PATH 固定补上 —— 那个地址要抄进手机上的实验文件，
+     * 少一处能填错的地方。
+     *
+     * `pushSecret` 空着 = 推这条腿不通。和 spyApi.webhookSecret 一个道理：
+     * 不能默认开一个谁都能往里打的口子，那等于把「角色被抱了」交给公网。
+     */
+    pushUrl: "",
+    pushSecret: "",
+    pushRate: 20,
+    pushInterval: 2,
+    /*
+     * phyphox 里那个实验的 buffer 名。默认值按它自带的「Acceleration without g」
+     * （线性加速度）猜的 —— 面板上「测试连接」会把手机上真实的名字列出来，
+     * 对不上让用户自己改。
+     */
+    magnitude: "acc",
+    time: "acc_time",
+    // 遮挡（接近 / 光线）buffer，可留空。填了之后「抱着不动」也能算进时长，
+    // 见 doll.js:feedDollSamples
+    cover: "",
+    coverBelow: 5,
+    // 轮询间隔（毫秒）。phyphox 那个服务器单线程而且慢，不能太密，见 doll.js 文件头
+    intervalMs: 400,
+    // 实验停着时替用户按一下「开始」（手机上开着 phyphox 但没点播放的情况）
+    autoStart: true,
+    // 判定阈值，含义和默认值的来路都在 doll.js:DOLL_DEFAULTS
+    start: 2,
+    hold: 0.25,
+    quietMs: 4000,
+    minHoldMs: 1500,
+    soft: 4,
+    firm: 10,
+  },
   ttsApi: {
     // speed 语速 0.5–2，1 = 原速
     minimax: { enabled: false, key: "", groupId: "", model: "speech-02-hd", host: "", speed: 1 },
@@ -1171,6 +1225,7 @@ function normalizeRole(input, id, legacy) {
     description: str(input?.description),
     projectRef: str(input?.projectRef),
     chatModel: { ...chat },
+    hug: normalizeHug(input?.hug),
     fallbackModel: {
       ...fb,
       enabled:
@@ -2322,6 +2377,92 @@ function normalizeSpyApi(input) {
  * 不去重、不排序 —— 顺序是用户填的顺序，界面上和提示词里都按这个顺序走
  * （和 parseFeatureList 一个道理）。同名两条的话 matchPlaylist 取先出现的那个。
  */
+function normalizeDollApi(input) {
+  return {
+    enabled: Boolean(input?.enabled),
+    // 认不出来的一律当 pull —— 老配置里压根没这个字段，而它们都是拉模式
+    mode: input?.mode === "push" ? "push" : "pull",
+    // 用户可能连 http:// 一起粘进来，留着原样 —— 补协议是 doll.js:dollUrl 的事
+    host: str(input?.host).trim(),
+    // 末尾的斜杠掐掉：拼路径时固定补 DOLL_PUSH_PATH，留着会拼出 `//doll/hug`
+    pushUrl: str(input?.pushUrl).trim().replace(/\/+$/, ""),
+    pushSecret: str(input?.pushSecret).trim(),
+    /*
+     * 采样率。上限 100Hz：再高手机那边每包就是几千个样本，而判定一次拥抱
+     * 二十来 Hz 绰绰有余（抱起来那一下持续好几百毫秒）。下限 5Hz：再低会
+     * 整个错过尖峰，于是永远认不出「抱起来」。
+     */
+    pushRate: clampInt(input?.pushRate, 20, 5, 100),
+    /*
+     * 多久推一次。这直接就是**反应延迟** —— 抱完最多等这么久角色才开口。
+     * 上限 30 秒；下限 1 秒（手机每秒发一个请求已经挺费电了）。
+     */
+    pushInterval: clampInt(input?.pushInterval, 2, 1, 30),
+    magnitude: str(input?.magnitude).trim() || "acc",
+    time: str(input?.time).trim() || "acc_time",
+    cover: str(input?.cover).trim(),
+    // 上限给得很松：接近传感器是厘米（0~10），光线传感器是勒克斯（室内几百，
+    // 太阳底下几万），同一个框要装得下两种量纲
+    coverBelow: clampNum(input?.coverBelow, DOLL_DEFAULTS.coverBelow, 0, 200_000),
+    /*
+     * 下限 200ms：再密就只是在给那个单线程服务器添堵，拿回来的样本还是同一批。
+     * 上限 3 秒：抱一下最短也就一两秒，轮询比那还慢会整次漏掉。两头都在
+     * doll.js 定义（POLL_MIN_MS / POLL_MAX_MS）。
+     */
+    intervalMs: clampInt(input?.intervalMs, 400, POLL_MIN_MS, POLL_MAX_MS),
+    // 缺键当开 —— 这个默认开着，老配置升上来不该变成关
+    autoStart: input?.autoStart === undefined ? true : Boolean(input.autoStart),
+    start: clampNum(input?.start, DOLL_DEFAULTS.start, 0.05, 100),
+    hold: clampNum(input?.hold, DOLL_DEFAULTS.hold, 0.01, 100),
+    // 安静判定的下限 500ms：短于这个会把「抱着换个姿势」切成两次拥抱
+    quietMs: clampInt(input?.quietMs, DOLL_DEFAULTS.quietMs, 500, 60_000),
+    // 0 = 不设下限（什么动静都算一次抱）。真有人想要那种灵敏度，留着这条路
+    minHoldMs: clampInt(input?.minHoldMs, DOLL_DEFAULTS.minHoldMs, 0, 60_000),
+    soft: clampNum(input?.soft, DOLL_DEFAULTS.soft, 0.05, 100),
+    /*
+     * 「用力」那一档不能低于「轻轻」那一档 —— 填反了的话 hugStrength 里
+     * `peak < soft` 会先命中，所有拥抱都变成「轻轻」，而用户在界面上看到的
+     * 两个数明明是一大一小。所以这儿直接托底，不报错也不留着错的值。
+     */
+    firm: Math.max(
+      clampNum(input?.firm, DOLL_DEFAULTS.firm, 0.05, 1_000),
+      clampNum(input?.soft, DOLL_DEFAULTS.soft, 0.05, 100)
+    ),
+  };
+}
+
+/**
+ * 角色身上的「共感娃娃」：开关、那句系统提示的文案、冷却。
+ *
+ * 为什么文案在角色上而手机地址在全局：文案是**这个角色**该怎么被告知这件事
+ * （娃娃叫什么、用什么语气说），一人一份才有意义；手机地址是用户那部手机，
+ * 全局一份（见 DEFAULT_CONFIG.dollApi）。
+ *
+ * 冷却也在角色上：同一次拥抱会让**所有**开了这个开关的角色各收到一句，
+ * 而「多久算一次新的拥抱」是每个角色的性格问题（有的角色天天被抱也不腻，
+ * 有的设成一小时才响一次）。
+ */
+function normalizeHug(input) {
+  return {
+    enabled: Boolean(input?.enabled),
+    /*
+     * 空着**不**回落成默认文案，而是存空串、由 doll.js:renderHugLine 在用的
+     * 时候回落。理由和别处的提示词一样：存成默认值的话，以后改了默认文案，
+     * 老用户那边还是老的一句，而他从来没动过这个框。
+     */
+    template: str(input?.template, HUG_TEMPLATE_RICH),
+    /*
+     * 冷却（分钟）。0 = 不冷却，抱几下就响几下。
+     *
+     * 默认 10 分钟和主动消息发完之后那个冷却（proactive.js:COOLDOWN_MS）一样 ——
+     * 都是在防「模型连着自言自语」：一次拥抱就是一整轮模型调用，抱着玩偶
+     * 揉十下会变成十轮。冷却期内的那几次不丢，攒成 `{{次数}}` 下次一起说
+     * （见 imessage.js:hugTick）。
+     */
+    cooldownMinutes: clampInt(input?.cooldownMinutes, 10, 0, 24 * 60),
+  };
+}
+
 function normalizeSpyPlaylists(list) {
   if (!Array.isArray(list)) return [];
   return list
@@ -3069,6 +3210,7 @@ export function normalizeConfig(input) {
   base.weatherApi = normalizeWeatherApi(input.weatherApi);
   base.searchApi = normalizeSearchApi(input.searchApi);
   base.spyApi = normalizeSpyApi(input.spyApi);
+  base.dollApi = normalizeDollApi(input.dollApi);
   base.ttsApi = normalizeTtsApi(input.ttsApi);
   base.referenceImages = normalizeReferenceImages(input.referenceImages);
   base.mcpServers = normalizeMcpServers(input.mcpServers);
@@ -3091,7 +3233,7 @@ export function normalizeConfig(input) {
 
   // 引用指向已经不存在（或被关掉）的模型时不静默清空：
   // 保留原样，前端会标红提示「引用的模型已失效」，由用户决定改成哪个。
-  return base;
+  return applyModelDefaults(base, input);
 }
 
 /**
@@ -3210,6 +3352,7 @@ function mergeSecrets(main, data) {
   // 查岗手机那条腿同理（SMTP 密码 + 收图口子的校验密钥）
   // MCP 服务器列表整块只住密钥文件里（地址、token、环境变量）
   if (Array.isArray(data.mcpKeys)) merged.mcpServers = data.mcpKeys;
+  if (data.dollKeys && typeof data.dollKeys === "object") merged.dollApi = data.dollKeys;
   if (data.spyKeys && typeof data.spyKeys === "object") {
     merged.spyApi = data.spyKeys;
   }
@@ -3283,6 +3426,7 @@ function writeToDisk(normalized) {
     weatherKeys: normalized.weatherApi,
     searchKeys: normalized.searchApi,
     spyKeys: normalized.spyApi,
+    dollKeys: normalized.dollApi,
     mcpKeys: normalized.mcpServers,
     ttsKeys: normalized.ttsApi,
     cloudKeys: normalized.cloudBackup,
@@ -3302,6 +3446,7 @@ function writeToDisk(normalized) {
     searchApi: {},
     // 查岗手机那条腿（SMTP 密码 + 收图密钥）同理
     spyApi: {},
+    dollApi: {},
     // MCP 服务器列表同理
     mcpServers: [],
     // TTS 同理
@@ -3348,7 +3493,7 @@ export function readRawConfig() {
 }
 
 export function saveConfig(config) {
-  const normalized = normalizeConfig(config);
+  const normalized = normalizeConfig(prepareModelDefaults(config, loadConfig()));
   writeToDisk(normalized);
   cachedConfig = normalized;
   return cachedConfig;

@@ -59,6 +59,9 @@ const COMMANDS = new Set([
   "promptmodeoff",
   "offlineon",
   "offlineoff",
+  "hug",
+  "hugon",
+  "hugoff",
   "sumsmall",
   "sumbig",
   "checkphone",
@@ -103,6 +106,9 @@ const COMMAND_ALIASES = {
   提示词协助模式关闭: "promptmodeoff",
   开启线下: "offlineon",
   关闭线下: "offlineoff",
+  共感娃娃: "hug",
+  共感娃娃开启: "hugon",
+  共感娃娃关闭: "hugoff",
   小总结: "sumsmall",
   大总结: "sumbig",
   查手机: "checkphone",
@@ -397,6 +403,7 @@ function buildHelp(trigger) {
     "/提示词协助模式      角色让位，换提示词工程师帮你排查人设/世界书/预设",
     "           这期间说的话不进角色的上下文，也不会有任何角色扮演",
     "/提示词协助模式关闭  结束协助，这期间的对话一并丢掉，回到正常聊天",
+    "/共感娃娃  切换共感娃娃开关；也可用 /共感娃娃开启、/共感娃娃关闭",
     "/开启线下  开始演一段线下剧情。开着的时候这个角色的线上功能全部停用",
     "           （主动消息、消息格式与功能都不生效）；网页端「线下模式」里是同一段",
     "/小总结    立刻把还没总结过的那几轮剧情概括成一份",
@@ -848,6 +855,43 @@ function cmdOfflineOff() {
 }
 
 /** `/小总结`、`/大总结` —— 手动出一份，不看轮数够不够。 */
+function cmdHug({ config, role }, want) {
+  const now = Boolean(role?.hug?.enabled);
+  const next = want === "toggle" ? !now : want === "on";
+
+  if (next === now) {
+    return { text: `共感娃娃本来就是${now ? "开着" : "关着"}的。`, log: `快捷指令：共感娃娃没动（${now ? "开" : "关"}）` };
+  }
+
+  saveConfig({
+    ...config,
+    roles: (config.roles ?? []).map((r) =>
+      r.id === role.id ? { ...r, hug: { ...(r.hug ?? {}), enabled: next } } : r
+    ),
+  });
+
+  if (!next) {
+    return { text: "已关闭共感娃娃，再抱也不会打扰你了。", log: "快捷指令：共感娃娃关" };
+  }
+
+  /*
+   * 开了之后顺带体检一遍「手机那头」。这几句是**纯提示**，不挡着开 ——
+   * 用户可能就是先把开关打开、等会儿再去配手机。
+   */
+  const doll = config.dollApi ?? {};
+  let note = "";
+  if (!doll.enabled) {
+    note = "\n⚠️ 不过「连手机」那个总开关是关的，现在还收不到 —— 去网页端的角色设置 →「共感娃娃」里打开。";
+  } else if (doll.mode === "push") {
+    if (!String(doll.pushSecret ?? "").trim()) note = "\n⚠️ 不过推送密钥还没生成，手机推过来会被挡掉。";
+    else if (!String(doll.pushUrl ?? "").trim()) note = "\n⚠️ 不过手机要连的那个地址还没填。";
+  } else if (!String(doll.host ?? "").trim()) {
+    note = "\n⚠️ 不过手机地址还没填，这边不知道去哪儿读。";
+  }
+
+  return { text: `已开启共感娃娃，抱一下我就知道。${note}`, log: "快捷指令：共感娃娃开" };
+}
+
 function cmdSummary(kind) {
   return {
     offline: { action: kind === "big" ? "sumbig" : "sumsmall" },
@@ -951,6 +995,12 @@ export function tryCommand(text, ctx) {
       return cmdPromptMode(args);
     case "offlineon":
       return cmdOfflineOn(args);
+    case "hug":
+      return cmdHug(args, "toggle");
+    case "hugon":
+      return cmdHug(args, "on");
+    case "hugoff":
+      return cmdHug(args, "off");
     case "sumsmall":
       return cmdSummary("small");
     case "sumbig":

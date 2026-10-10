@@ -30,6 +30,7 @@ const VERSION = 1;
 /** 备份里认识的配置键。多出来的字段一律忽略。 */
 const KEYS = [
   "providers",
+  "modelDefaults",
   "chat",
   "roles",
   "users",
@@ -62,6 +63,7 @@ export function buildBundle(config, { includeSecrets = false } = {}) {
         keys: includeSecrets ? [...p.keys] : p.keys.map(() => ""),
       })),
       chat: config?.chat ?? {},
+      modelDefaults: config?.modelDefaults ?? {},
       roles: config?.roles ?? [],
       users: config?.users ?? [],
       presets: config?.presets ?? [],
@@ -90,6 +92,7 @@ export function buildBundle(config, { includeSecrets = false } = {}) {
       // 搜索和 TTS 的凭据同理
       searchKeys: config?.searchApi ?? {},
       ttsKeys: config?.ttsApi ?? {},
+      dollKeys: config?.dollApi ?? {},
       // MCP 服务器（地址、请求头里的 token、环境变量）同理
       mcpKeys: config?.mcpServers ?? [],
     };
@@ -186,6 +189,8 @@ export function applyBundle(bundle, current) {
     if (sk && typeof sk === "object" && !Array.isArray(sk)) next.searchApi = sk;
     const tk = bundle.secrets.ttsKeys;
     if (tk && typeof tk === "object" && !Array.isArray(tk)) next.ttsApi = tk;
+    const dk = bundle.secrets.dollKeys;
+    if (dk && typeof dk === "object" && !Array.isArray(dk)) next.dollApi = dk;
     if (Array.isArray(bundle.secrets.mcpKeys)) next.mcpServers = bundle.secrets.mcpKeys;
   } else {
     // 本地的 key 按 id 盖回导入的服务商上；备份里那些空串占位丢掉
