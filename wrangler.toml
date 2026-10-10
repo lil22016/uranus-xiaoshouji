@@ -42,4 +42,4 @@ new_sqlite_classes = ["Uranus"]
 # 角色过日子用的时区（提示词里的「现在几点」、定时日记、主动消息都按它）。
 # Worker 本身永远是 UTC，这里改成你自己的，比如 America/Los_Angeles
 [vars]
-TZ = "Asia/Shanghai"
+TZ = "America/New_York"
