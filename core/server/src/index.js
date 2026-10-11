@@ -48,6 +48,7 @@ import {
   handleDollPush,
   igSessionFor,
   triggerLocationEvent,
+  triggerCompanionSession,
 } from "./imessage.js";
 import {
   buildDollExperiment,
@@ -61,6 +62,7 @@ import {
   summarizeCalib,
 } from "./doll.js";
 import { getLastPrompt } from "./lastprompt.js";
+import { appendCompanionContext, clearCompanionContext, getCompanionContext } from "./companioncontext.js";
 import {
   BATTERY_PATH,
   DEFAULT_WEBHOOK_PATH,
@@ -1505,6 +1507,27 @@ app.get("/api/logs/stream", (req, res) => {
     unsubscribe();
   });
 });
+
+// ---- Companion -> Uranus session bridge ----
+app.post("/api/companion/bridge", express.json({ limit: "64kb" }), async (req, res) => {
+  try {
+    const config = loadConfig();
+    const body = req.body || {};
+    const wantedId = String(body.roleId || "").trim();
+    const wantedName = String(body.characterName || "").trim().toLowerCase();
+    const role = (config.roles || []).find(r => wantedId && r.id === wantedId)
+      || (config.roles || []).find(r => wantedName && String(r.name || "").trim().toLowerCase() === wantedName);
+    if (!role) return res.status(400).json({ ok:false, error:"Companion Bridge could not resolve a Uranus role. Send roleId or a matching characterName." });
+    logInfo("Companion", `${role.name}: received Companion session`, String(body.text||"").slice(0,1200));
+    const state = appendCompanionContext(role.id, body, body.maxContextChars);
+    const decision = body.type === "session_activity"
+      ? await triggerCompanionSession(loadConfig, role.id, body.text)
+      : {ok:true,respondNow:false,reason:"context_only"};
+    res.json({ ok:true, roleId:role.id, roleName:role.name, updatedAt:state.updated_at, decision });
+  } catch (e) { logError("Companion","Bridge request failed",e); res.status(400).json({ ok:false, error:String(e?.message ?? e) }); }
+});
+app.get("/api/companion/context/:roleId", (req, res) => res.json({ ok:true, context:getCompanionContext(req.params.roleId) }));
+app.delete("/api/companion/context/:roleId", (req, res) => res.json({ ok:true, context:clearCompanionContext(req.params.roleId) }));
 
 // ---- iMessage 桥接状态 ----
 app.get("/api/status", (_req, res) => {

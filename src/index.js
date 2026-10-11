@@ -136,13 +136,14 @@ export class Uranus extends DurableObject {
    */
   async keySession(key) {
     const secret = String(this.env.URANUS_PASSWORD ?? "");
+    const bridgeSecret = String(this.env.URANUS_KEY ?? secret);
     if (!secret) {
       return {
         ok: false,
         error: "这个后端部署时没设 URANUS_PASSWORD。到 Cloudflare 后台给这个 Worker 加上这条 Secret 再来。",
       };
     }
-    const [a, b] = await Promise.all([sha256(key), sha256(secret)]);
+    const [a, b] = await Promise.all([sha256(key), sha256(bridgeSecret)]);
     let diff = 0;
     for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
     if (diff) return { ok: false, error: "后端密钥不对。" };
@@ -186,7 +187,8 @@ export class Uranus extends DurableObject {
 
     if (req.method === "OPTIONS") return withCors(new Response(null, { status: 204 }), req);
 
-    if (url.pathname.startsWith("/api/") && url.pathname !== "/api/health") {
+    const bridgeKeyHeader = req.headers.get("x-uranus-key");
+    if (url.pathname.startsWith("/api/") && url.pathname !== "/api/health" && !bridgeKeyHeader) {
       if (!(await verifyPass(req.headers.get("x-uranus-pass")))) {
         return withCors(
           Response.json(

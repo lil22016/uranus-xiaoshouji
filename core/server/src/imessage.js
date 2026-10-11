@@ -107,6 +107,7 @@ import {
   randomWaitMs,
 } from "./proactive.js";
 import { buildPrompt } from "./prompt.js";
+import { injectCompanionContext } from "./companioncontext.js";
 import { dropSlot, pruneSchedule, saveSlot, slotsFor } from "./proactivestore.js";
 import {
   appendAssist,
@@ -3337,7 +3338,8 @@ async function handleTurn(
    */
   const mcpKit = await roleToolkit(freshConfig, freshRole, scope);
   // 查手机「同步到私聊」：最近一次查手机的摘要，只进这一份提示词（见 phonecheck.js:phoneNote）
-  const withPhone = injectPhoneNote(built.messages, phoneNote(freshConfig, freshRole));
+  const withCompanion = injectCompanionContext(built.messages, freshRole.id);
+  const withPhone = injectPhoneNote(withCompanion, phoneNote(freshConfig, freshRole));
   const messages = mcpKit ? injectToolPrompt(withPhone, mcpKit) : withPhone;
 
   if (worldInfo.hitNames.length) {
@@ -4436,6 +4438,49 @@ async function fireProactive(getConfig, runner, spaceId) {
  * 时间前缀照加：和别的 user 轮次一致，「自主判断」那边也要靠它才知道
  * 上一次是什么时候的事。
  */
+export async function triggerCompanionSession(getConfig, roleId, packet) {
+  const config = getConfig();
+  const role = (config.roles || []).find(r => String(r.id) === String(roleId));
+  if (!role) return { ok:false, error:"role_not_found" };
+  const runner = runnerForRole(config, role);
+  if (!runner || !runner.lastSpace?.space) {
+    logWarn("Companion", `${role.name}: received a session, but there is no active iMessage conversation to send to; kept as context only`);
+    return { ok:true, respondNow:false, reason:"no_active_imessage_space" };
+  }
+  const eps = resolveRoleEndpoints(config, role);
+  if (!eps.chat) return { ok:true, respondNow:false, reason:"no_chat_endpoint" };
+  const peer = runner.lastSpace.peer || runner.lastSpace.spaceId;
+  const sessionId = sessionIdOf(runner, role, peer);
+  const user = resolveUser(config, role);
+  loadHistory(runner, role, sessionId, "Companion");
+  const history = runner.history.get(sessionId) ?? [];
+  const judgeText = `A Companion app session just ended. This is background activity by ${user?.name || "the user"}:\n\n${String(packet||"").slice(0,6000)}\n\nDecide whether ${role.name} would naturally send an iMessage RIGHT NOW because of this session. Consider the full relationship/persona, recent conversation, intrusiveness, repetition, and whether the activity actually invites a response. Silence is completely valid. Reply with exactly RESPOND or DEFER.`;
+  const built = await buildPrompt(config, role, user, [...history,{role:"user",content:judgeText}], "");
+  const judgeMessages = injectCompanionContext(built.messages, role.id);
+  let verdict="DEFER";
+  try {
+    const out=await chatWithFallback(eps.chat, eps.fallback, judgeMessages, {...built.params, max_tokens:64});
+    verdict=String(out.content||"").trim().toUpperCase();
+  } catch(e) {
+    logError("Companion", `${role.name}: respond-now decision failed; deferred`, e);
+    return {ok:true,respondNow:false,reason:"judge_failed"};
+  }
+  const respondNow=/^RESPOND\b/.test(verdict);
+  logInfo("Companion", `${role.name}: session decision = ${respondNow?"RESPOND":"DEFER"}`, String(packet||"").slice(0,1200));
+  if(!respondNow) return {ok:true,respondNow:false};
+  const spaceId=runner.lastSpace.spaceId;
+  const slot=proactiveSlot(runner,spaceId);
+  slot.space=runner.lastSpace.space;
+  slot.peer=peer;
+  await chain(runner,spaceId,()=>runProactiveTurn(getConfig,runner,slot,spaceId,{
+    label:"Companion session",
+    scope:"Companion",
+    toModel:`A Companion session just ended. You decided it was natural to message ${user?.name||"the user"} now. The session activity is already available in <Companion_Context>. Send whatever you would naturally send now. Do not explain that a session ended or mention system/context mechanics.`,
+    toHistory:"[Companion session prompted a natural message]"
+  }),"Companion session message failed");
+  return {ok:true,respondNow:true};
+}
+
 async function runProactiveTurn(getConfig, runner, slot, spaceId, override = null) {
   const config = getConfig();
   const role = currentRole(config, runner);
@@ -4497,7 +4542,8 @@ async function runProactiveTurn(getConfig, runner, slot, spaceId, override = nul
   // MCP 工具：主动开口的这一路也给（「早上自己开口前先查一下今天的日程」），
   // 和正常轮次同一套，见那边的注释
   const mcpKit = await roleToolkit(config, role, scope);
-  const withPhone = injectPhoneNote(built.messages, phoneNote(config, role));
+  const withCompanion = injectCompanionContext(built.messages, role.id);
+  const withPhone = injectPhoneNote(withCompanion, phoneNote(config, role));
   const messages = mcpKit ? injectToolPrompt(withPhone, mcpKit) : withPhone;
 
   // buildPrompt 会按上下文上限裁剪。裁完的最后一条是提示词那份，换成占位符
