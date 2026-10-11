@@ -4443,13 +4443,47 @@ export async function triggerCompanionSession(getConfig, roleId, packet) {
   const role = (config.roles || []).find(r => String(r.id) === String(roleId));
   if (!role) return { ok:false, error:"role_not_found" };
   const runner = runnerForRole(config, role);
-  if (!runner || !runner.lastSpace?.space) {
-    logWarn("Companion", `${role.name}: received a session, but there is no active iMessage conversation to send to; kept as context only`);
-    return { ok:true, respondNow:false, reason:"no_active_imessage_space" };
+  if (!runner) {
+    logWarn("Companion", `${role.name}: received a session, but its iMessage bridge is not running; kept as context only`);
+    return { ok:true, respondNow:false, reason:"imessage_bridge_not_running" };
   }
+
+  /*
+   * Companion is an out-of-band trigger: it may arrive long after the last inbound
+   * iMessage, or just after this process restarted.  Requiring lastSpace.space to
+   * still be alive in RAM makes a perfectly known conversation look "inactive".
+   *
+   * Incoming iMessages already persist the latest routable chat in doll-chats.json
+   * (the same durable target used by the hug/reminder-style proactive path).  Prefer
+   * the live lastSpace when available, otherwise recover that persisted target and
+   * rebuild the SDK space with ensureSpace().  We never guess a recipient.
+   */
+  const savedChats = readJson(`${DATA_DIR}/doll-chats.json`, {});
+  const saved = savedChats?.[role.id];
+  const live = runner.lastSpace;
+  let target = live?.spaceId
+    ? { spaceId: live.spaceId, peer: live.peer, space: live.space }
+    : (saved?.spaceId && (!saved.projectRefId || saved.projectRefId === runner.projectRefId)
+        ? { spaceId: saved.spaceId, peer: saved.peer, space: null }
+        : null);
+
+  if (!target?.spaceId) {
+    logWarn("Companion", `${role.name}: received a session, but no previous iMessage conversation is known yet; kept as context only`);
+    return { ok:true, respondNow:false, reason:"no_known_imessage_target" };
+  }
+
+  if (!target.space) {
+    const recovered = await ensureSpace(runner, target, target.spaceId);
+    if (!recovered) {
+      logWarn("Companion", `${role.name}: knows the last iMessage conversation but could not reopen it; kept as context only`);
+      return { ok:true, respondNow:false, reason:"imessage_target_unavailable" };
+    }
+    logInfo("Companion", `${role.name}: recovered the last iMessage conversation for Companion delivery`);
+  }
+
   const eps = resolveRoleEndpoints(config, role);
   if (!eps.chat) return { ok:true, respondNow:false, reason:"no_chat_endpoint" };
-  const peer = runner.lastSpace.peer || runner.lastSpace.spaceId;
+  const peer = target.peer || target.spaceId;
   const sessionId = sessionIdOf(runner, role, peer);
   const user = resolveUser(config, role);
   loadHistory(runner, role, sessionId, "Companion");
@@ -4468,9 +4502,9 @@ export async function triggerCompanionSession(getConfig, roleId, packet) {
   const respondNow=/^RESPOND\b/.test(verdict);
   logInfo("Companion", `${role.name}: session decision = ${respondNow?"RESPOND":"DEFER"}`, String(packet||"").slice(0,1200));
   if(!respondNow) return {ok:true,respondNow:false};
-  const spaceId=runner.lastSpace.spaceId;
+  const spaceId=target.spaceId;
   const slot=proactiveSlot(runner,spaceId);
-  slot.space=runner.lastSpace.space;
+  slot.space=target.space;
   slot.peer=peer;
   await chain(runner,spaceId,()=>runProactiveTurn(getConfig,runner,slot,spaceId,{
     label:"Companion session",
