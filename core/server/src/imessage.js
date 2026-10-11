@@ -4462,15 +4462,30 @@ export async function triggerCompanionSession(getConfig, roleId, packet) {
   const saved = savedChats?.[role.id];
   const live = runner.lastSpace;
   let target = live?.spaceId
-    ? { spaceId: live.spaceId, peer: live.peer, space: live.space }
+    ? { spaceId: live.spaceId, peer: live.peer, space: live.space, source:"live" }
     : (saved?.spaceId && (!saved.projectRefId || saved.projectRefId === runner.projectRefId)
-        ? { spaceId: saved.spaceId, peer: saved.peer, space: null }
+        ? { spaceId: saved.spaceId, peer: saved.peer, space: null, source:"saved-last-chat" }
         : null);
 
+  // A last-chat record may not exist yet on older Worker data. The proactive store is
+  // already durable and also contains real chat GUIDs, so it is a safe fallback. Never
+  // guess between multiple conversations: only use it when there is exactly one candidate.
   if (!target?.spaceId) {
-    logWarn("Companion", `${role.name}: received a session, but no previous iMessage conversation is known yet; kept as context only`);
-    return { ok:true, respondNow:false, reason:"no_known_imessage_target" };
+    const candidates = new Map();
+    for (const [spaceId, slot] of runner.proactive || []) {
+      if (spaceId) candidates.set(spaceId, { spaceId, peer:slot?.peer, space:slot?.space||null, source:"live-proactive-slot" });
+    }
+    for (const row of slotsFor(runner.projectRefId) || []) {
+      if (row?.spaceId) candidates.set(row.spaceId, { spaceId:row.spaceId, peer:row.peer, space:null, source:"saved-proactive-slot" });
+    }
+    if (candidates.size === 1) target = [...candidates.values()][0];
   }
+
+  if (!target?.spaceId) {
+    logWarn("Companion", `${role.name}: Companion target resolver v2 found no unambiguous saved iMessage conversation; kept as context only`);
+    return { ok:true, respondNow:false, reason:"no_known_imessage_target_v2" };
+  }
+  logInfo("Companion", `${role.name}: Companion target resolver v2 selected ${target.source} (${target.spaceId})`);
 
   if (!target.space) {
     const recovered = await ensureSpace(runner, target, target.spaceId);
