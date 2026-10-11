@@ -62,7 +62,7 @@ import {
   summarizeCalib,
 } from "./doll.js";
 import { getLastPrompt } from "./lastprompt.js";
-import { appendCompanionContext, clearCompanionContext, getCompanionContext } from "./companioncontext.js";
+import { appendCompanionContext, clearCompanionContext, getCompanionContext, hasCompanionReceipt, markCompanionReceipt } from "./companioncontext.js";
 import {
   BATTERY_PATH,
   DEFAULT_WEBHOOK_PATH,
@@ -1518,12 +1518,18 @@ app.post("/api/companion/bridge", express.json({ limit: "64kb" }), async (req, r
     const role = (config.roles || []).find(r => wantedId && r.id === wantedId)
       || (config.roles || []).find(r => wantedName && String(r.name || "").trim().toLowerCase() === wantedName);
     if (!role) return res.status(400).json({ ok:false, error:"Companion Bridge could not resolve a Uranus role. Send roleId or a matching characterName." });
+    const packetId = String(body.packetId || body.id || "").trim();
+    if (packetId && hasCompanionReceipt(role.id, packetId)) {
+      logInfo("Companion", `${role.name}: duplicate Companion packet acknowledged`, packetId);
+      return res.json({ ok:true, accepted:true, duplicate:true, packetId, roleId:role.id, roleName:role.name });
+    }
     logInfo("Companion", `${role.name}: received Companion session`, String(body.text||"").slice(0,1200));
-    const state = appendCompanionContext(role.id, body, body.maxContextChars);
+    const state = appendCompanionContext(role.id, { ...body, id: packetId || body.id }, body.maxContextChars);
     const decision = body.type === "session_activity"
       ? await triggerCompanionSession(loadConfig, role.id, body.text)
       : {ok:true,respondNow:false,reason:"context_only"};
-    res.json({ ok:true, roleId:role.id, roleName:role.name, updatedAt:state.updated_at, decision });
+    if (packetId) markCompanionReceipt(role.id, packetId, body.eventIds);
+    res.json({ ok:true, accepted:true, duplicate:false, packetId, roleId:role.id, roleName:role.name, updatedAt:state.updated_at, decision });
   } catch (e) { logError("Companion","Bridge request failed",e); res.status(400).json({ ok:false, error:String(e?.message ?? e) }); }
 });
 app.get("/api/companion/context/:roleId", (req, res) => res.json({ ok:true, context:getCompanionContext(req.params.roleId) }));

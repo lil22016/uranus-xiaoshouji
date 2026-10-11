@@ -11,7 +11,7 @@ function safeId(value) {
   return String(value || "default").replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 120) || "default";
 }
 function fileFor(roleId) { return path.join(DIR, `${safeId(roleId)}.json`); }
-function blank() { return { user_life: [], character_life: [], interactions: [], updated_at: null }; }
+function blank() { return { user_life: [], character_life: [], interactions: [], receipts: [], updated_at: null }; }
 function readState(roleId) {
   try { return { ...blank(), ...JSON.parse(fs.readFileSync(fileFor(roleId), "utf8")) }; }
   catch { return blank(); }
@@ -50,6 +50,21 @@ export function appendCompanionContext(roleId, payload, maxChars = MAX_TOTAL_CHA
   });
   state.updated_at = new Date().toISOString();
   writeState(roleId, bounded(state, Math.max(800, Math.min(Number(maxChars)||MAX_TOTAL_CHARS, 6000))));
+  return state;
+}
+export function hasCompanionReceipt(roleId, packetId) {
+  const id = String(packetId || "").trim();
+  if (!id) return false;
+  return (readState(roleId).receipts || []).some(x => x.id === id);
+}
+export function markCompanionReceipt(roleId, packetId, eventIds = []) {
+  const id = String(packetId || "").trim();
+  if (!id) return readState(roleId);
+  const state = readState(roleId);
+  state.receipts = (state.receipts || []).filter(x => x.id !== id);
+  state.receipts.push({ id, event_ids: Array.isArray(eventIds) ? eventIds.map(String).slice(-100) : [], accepted_at: new Date().toISOString() });
+  state.receipts = state.receipts.slice(-200);
+  writeState(roleId, state);
   return state;
 }
 export function getCompanionContext(roleId) { return readState(roleId); }
