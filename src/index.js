@@ -1,212 +1,383 @@
+/**
+ * Uranus 小手机的后端：整个桌面版后端原样跑在一个 Durable Object 里。
+ *
+ * ── 怎么做到「原样」的 ──
+ *
+ *  - 数据：server 里全是同步的 fs 调用，底下换成 DO 的同步 KV（shims/fs.js）。
+ *  - HTTP：桌面版是 express，Worker 现在能跑 node:http 服务器 ——
+ *    index.js 照常 `app.listen(8787)`，这里用 handleAsNodeRequest 把请求递进去。
+ *    控制台用的 140 个接口一个不用改。
+ *  - iMessage：Photon SDK 只换传输层（shims/nice-grpc.js，grpc-web），
+ *    收消息从「长连接订阅」换成「Photon 推 webhook 到 /hook」（shims/spectrum.js）。
+ *  - 定时器：DO 没请求时会被收走，内存里的计时（主动消息、合并窗口）就没了。
+ *    所以挂一个每 30 秒一次的 alarm 心跳让它一直醒着；万一还是被收走了，
+ *    下一次心跳重新启动，桌面版自己会从磁盘把排着的主动消息捞回来接着数。
+ *  - 时区：Worker 永远是 UTC，本地时间按 wrangler.toml 里的 TZ 算（shims/tz.js）。
+ *
+ * ── 控制台和这里不同源 ──
+ *
+ * 控制台不用登录：连后端时填一次部署时设的 URANUS_PASSWORD（界面上叫「后端密钥」），
+ * 之后每个请求都带 `x-uranus-key`。这里对上了，就替它补一条桌面版认的会话
+ * cookie，桌面版那套登录于是一直是「已登录」。
+ *
+ * 另一条路 `Authorization: Bearer <token>`（桌面版登录拿到的会话）也还认：
+ * 登录 / 改密码回的 Set-Cookie 翻成 `x-uranus-token` 头。iOS Safari 拦第三方
+ * cookie，所以两条路都不走 cookie。
+ *
+ * ── 控制台登录 ──
+ *
+ * 上面两条之外，所有 /api 请求（/api/health 除外）还得带一张控制台登录凭证
+ * `x-uranus-pass`（见 gate.js）：Uranus 小手机的控制台要先登录才能用，
+ * 自己另编一份不登录的界面连不上这里。
+ */
 import { DurableObject } from "cloudflare:workers";
+import { handleAsNodeRequest } from "cloudflare:node";
+import { setBackend, existsSync, readFileSync, writeFileSync, installFetchBodies } from "./shims/fs.js";
+import { installTimers } from "./shims/timers.js";
+import { installTimeZone } from "./shims/tz.js";
+import { deliverWebhook, setWebhookRegistry, waitLive } from "./shims/spectrum.js";
+import { BUILTIN_PRESETS, BUILTIN_TRANSFER_LOGOS } from "../core/assets.js";
+import { verifyPass } from "./gate.js";
 
-const j = (data, status=200) => new Response(JSON.stringify(data), {status, headers:{"content-type":"application/json; charset=utf-8"}});
-const nowIso = () => new Date().toISOString();
-const clamp = (n,a,b) => Math.max(a,Math.min(b,Number(n)||0));
-const id = (p) => `${p}_${crypto.randomUUID()}`;
-const DEFAULTS = {
-  characterName:"Loki", userName:"Raylee", timezone:"America/New_York",
-  autonomy:{enabled:false,minVisits:2,maxVisits:4,minIntervalMinutes:30,activeStart:"08:00",activeEnd:"23:30"},
-  reactionLibrary:["❤️","🙄","😂","😭","😒","🤨","😌","💀","👀"],
-  agent:{profileId:"",persona:"",userPersona:"",worldbook:"",instructions:"Write briefly and naturally. Do not invent shared experiences. Do not react to everything."},
-  modelProfiles:[],
-  bridge:{enabled:false,url:"",key:"",immediateReaction:"decide",maxContextChars:2800}
-};
+const PORT = 8787;
+const HEARTBEAT_MS = 30_000;
+const PHOTON = "https://spectrum.photon.codes";
+const COOKIE = "uranus_session";
+const RESTORE_PATHS = new Set(["/api/cloud/pull"]);
 
-export class Companion extends DurableObject {
-  constructor(ctx, env){ super(ctx,env); this.ctx=ctx; this.env=env; }
-  get(k,d=null){ const v=this.ctx.storage.kv.get(k); return v===undefined?d:v; }
-  put(k,v){ this.ctx.storage.kv.put(k,v); }
-  settings(){ return {...DEFAULTS,...this.get("settings",{}), autonomy:{...DEFAULTS.autonomy,...(this.get("settings",{}).autonomy||{})}, agent:{...DEFAULTS.agent,...(this.get("settings",{}).agent||{})}, bridge:{...DEFAULTS.bridge,...(this.get("settings",{}).bridge||{})}}; }
-  list(kind){ return this.get(`list:${kind}`,[]); }
-  save(kind, arr){ this.put(`list:${kind}`,arr); }
-  add(kind, item){ const arr=this.list(kind); arr.push(item); this.save(kind,arr); return item; }
-  update(kind, itemId, patch){ const arr=this.list(kind); const i=arr.findIndex(x=>x.id===itemId); if(i<0)return null; arr[i]={...arr[i],...patch,updatedAt:nowIso()}; this.save(kind,arr); return arr[i]; }
-  async fetch(req){
-    const u=new URL(req.url), p=u.pathname, m=req.method;
-    if(p==="/api/health") return j({ok:true});
-    if(!(await this.auth(req))) return j({ok:false,error:"Bad companion password"},401);
-    if(p==="/api/bootstrap"&&m==="GET") return j({ok:true,settings:this.settings(),schedule:this.list("schedule"),diary:this.list("diary"),comments:this.list("comments"),reactions:this.list("reactions"),highlights:this.list("highlights"),notifications:this.list("notifications").slice(-50).reverse()});
-    if(p==="/api/settings"&&m==="PUT") return this.setSettings(req);
-    if(p==="/api/admin/fresh-start"&&m==="POST") return this.freshStart();
-    if(p==="/api/schedule"&&m==="POST") return this.createSchedule(req);
-    if(p.startsWith("/api/schedule/")&&m==="PATCH") return this.patch("schedule",p.split("/").pop(),req);
-    if(p.startsWith("/api/schedule/")&&m==="DELETE") return this.remove("schedule",p.split("/").pop());
-    if(p==="/api/diary"&&m==="POST") return this.createDiary(req);
-    if(p.startsWith("/api/diary/")&&m==="PATCH") return this.patch("diary",p.split("/").pop(),req);
-    if(p.startsWith("/api/diary/")&&m==="DELETE") return this.remove("diary",p.split("/").pop());
-    if(p==="/api/comment"&&m==="POST") return this.createComment(req);
-    if(p==="/api/reaction"&&m==="POST") return this.createReaction(req);
-    if(p==="/api/highlight"&&m==="POST") return this.createHighlight(req);
-    if(p==="/api/agent/run"&&m==="POST") return this.agentRun(req);
-    if(p==="/api/session/commit"&&m==="POST") return this.commitSession(req);
-    if(p==="/api/notifications/read"&&m==="POST"){ this.save("notifications",this.list("notifications").map(x=>({...x,read:true}))); return j({ok:true}); }
-    return j({ok:false,error:"Not found"},404);
+export class Uranus extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env);
+    setBackend(ctx.storage.kv);
+    installTimers();
+    installFetchBodies();
+    this.kv = ctx.storage.kv;
+    this.booting = null;
   }
-  async auth(req){ const secret=String(this.env.COMPANION_PASSWORD||""); if(!secret)return true; const got=req.headers.get("x-companion-key")||""; return got===secret; }
-  async body(req){ try{return await req.json();}catch{return{};} }
-  async freshStart(){
-    const kinds=["schedule","diary","comments","reactions","highlights","notifications"];
-    const deleted={};
-    for(const kind of kinds){
-      const items=this.list(kind);
-      deleted[kind]=items.length;
-      this.save(kind,[]);
+
+  boot() {
+    this.booting ??= this.#boot().catch((e) => {
+      this.booting = null;
+      throw e;
+    });
+    return this.booting;
+  }
+
+  async #boot() {
+    Object.assign(process.env, {
+      PORT: String(PORT),
+      URANUS_IG_PORT: "off",
+      URANUS_WORKER: "1",
+      // 控制台没有思考模式开关：默认关闭 DeepSeek 思考；false 恢复上游默认。
+      URANUS_DEEPSEEK_NON_THINKING: String(this.env.URANUS_DEEPSEEK_NON_THINKING ?? "true"),
+      TZ: process.env.TZ || this.env.TZ || "Asia/Shanghai",
+    });
+    installTimeZone(process.env.TZ);
+    seedPresets();
+    seedTransferLogos();
+    setWebhookRegistry({ ensure: (id, secret) => this.ensureWebhook(id, secret) });
+    this.auth = await import("../core/server/src/auth.js");
+    await this.seedPassword();
+    await import("../core/server/src/index.js");
+    await installRestart();
+    await this.arm();
+  }
+
+  /**
+   * 部署时设的 URANUS_PASSWORD 直接当成第一次的密码。
+   *
+   * 桌面版出厂是 Uranus / Uranus、登进来强制改。那在本机没问题，可 workers.dev
+   * 是公网地址 —— 部署完到你第一次登录之间，谁先打开谁就能用出厂密码抢走。
+   * 所以这里不给出厂密码的窗口：没设 URANUS_PASSWORD 的话出厂密码也登不进去
+   * （见 fetch 里那道闸）。
+   *
+   * 这条 Secret 也是忘了密码时的出路：桌面版是去改 data/auth.json，这里没有能
+   * 手改的文件。所以记下「上次用的是哪条 Secret」（只存哈希），到 Cloudflare
+   * 后台把它改成新的，Worker 重新部署、醒来发现不一样，就把账号密码重置成
+   * 它。Secret 没变就不动 —— 在控制台里改过的密码照旧有效。
+   */
+  async seedPassword() {
+    const password = String(this.env.URANUS_PASSWORD ?? "");
+    if (!password) return;
+    const mark = await sha256(password);
+    const seen = this.kv.get("passwordSecret");
+    if (!this.auth.mustChangeCredentials()) {
+      // 这条之前的部署没记过：当它已经用过，免得一升级就把改过的密码冲掉
+      if (seen === undefined) this.kv.put("passwordSecret", mark);
+      if (seen === undefined || seen === mark) return;
+      console.log("URANUS_PASSWORD 换了，账号密码按它重置");
     }
-    const pending=this.get("pending:user",[]);
-    deleted.pendingUser=Array.isArray(pending)?pending.length:0;
-    this.put("pending:user",[]);
-    return j({ok:true,freshStart:true,deleted,settingsPreserved:true});
+    await this.resetPassword(password);
   }
-  async setSettings(req){ const b=await this.body(req); const old=this.settings(); const a=b.autonomy||{}; const next={...old,...b,autonomy:{...old.autonomy,...a,minVisits:clamp(a.minVisits??old.autonomy.minVisits,0,10),maxVisits:clamp(a.maxVisits??old.autonomy.maxVisits,0,10),minIntervalMinutes:clamp(a.minIntervalMinutes??old.autonomy.minIntervalMinutes,0,1440)},reactionLibrary:[...new Set((b.reactionLibrary??old.reactionLibrary).map(String))].slice(0,50)}; if(next.autonomy.maxVisits<next.autonomy.minVisits)next.autonomy.maxVisits=next.autonomy.minVisits; this.put("settings",next); await this.arm(); return j({ok:true,settings:next}); }
-  async createSchedule(req){ const b=await this.body(req); const x={id:id("s"),owner:"user",date:String(b.date||"").slice(0,10),time:String(b.time||"").slice(0,5),end:String(b.end||"").slice(0,5),text:String(b.text||"").trim(),status:"planned",createdAt:nowIso(),updatedAt:nowIso()}; if(!x.date||!x.text)return j({ok:false,error:"date and text required"},400); this.add("schedule",x); return j({ok:true,item:x}); }
-  async createDiary(req){ const b=await this.body(req); const owner="user", date=String(b.date||"").slice(0,10); let arr=this.list("diary"); const existing=arr.find(x=>x.owner===owner&&x.date===date); if(existing){ const item=this.update("diary",existing.id,{text:String(b.text||"").trim()}); return j({ok:true,item}); } const x={id:id("d"),owner,date,text:String(b.text||"").trim(),createdAt:nowIso(),updatedAt:nowIso()}; if(!date||!x.text)return j({ok:false,error:"date and text required"},400); this.add("diary",x); return j({ok:true,item:x}); }
-  target(type,targetId){ if(!["schedule","diary"].includes(type))return null; return this.list(type).find(x=>x.id===targetId)||null; }
-  async patch(kind,itemId,req){
-    const old=this.list(kind).find(x=>x.id===itemId);
-    if(!old)return j({ok:false,error:"Not found"},404);
-    if(old.owner!=="user")return j({ok:false,error:"Only your own entries can be edited here"},403);
-    const b=await this.body(req), patch={};
-    if(kind==="schedule"){
-      if(b.text!==undefined){patch.text=String(b.text).trim();if(!patch.text)return j({ok:false,error:"Text required"},400);}
-      if(b.date!==undefined)patch.date=String(b.date).slice(0,10);
-      if(b.time!==undefined)patch.time=String(b.time).slice(0,5);
-      if(b.end!==undefined)patch.end=String(b.end).slice(0,5);
-      if(b.status!==undefined){
-        if(!["planned","done","failed","cancelled","changed"].includes(b.status))return j({ok:false,error:"Invalid status"},400);
-        patch.status=b.status;
-        if(b.status==="changed"){
-          patch.actualText=String(b.actualText||"").trim();
-          if(!patch.actualText)return j({ok:false,error:"Describe what you did instead"},400);
-        }else patch.actualText="";
+
+  /** 桌面版的账号密码强制设成 password（清掉 auth.json 里的密码，再走一遍首次设置） */
+  async resetPassword(password) {
+    if (!this.auth.mustChangeCredentials()) {
+      const { AUTH_PATH, readJson, writeJson } = await import("../core/server/src/datadir.js");
+      writeJson(AUTH_PATH, { ...readJson(AUTH_PATH, {}), password: null });
+    }
+    const out = this.auth.changeCredentials({
+      username: String(this.env.URANUS_USER || "Uranus"),
+      password,
+    });
+    if (out.ok) this.kv.put("passwordSecret", await sha256(password));
+    else console.warn(`URANUS_PASSWORD 没用上：${out.error}`);
+    return out.ok;
+  }
+
+  /**
+   * 控制台带来的后端密钥对不对；对的话给一条能塞进 cookie 的会话。
+   *
+   * 会话是拿密钥走一遍桌面版的 login 签出来的（密码哈希要算一阵，所以缓存，
+   * 一天换一次，远早于它 30 天过期）。login 不过 —— 有人走 Bearer 那条路改过
+   * 密码 —— 就把密码拉回密钥再签：密钥才是这个后端的钥匙。
+   *
+   * @returns {Promise<{ok: true, token: string} | {ok: false, error: string}>}
+   */
+  async keySession(key) {
+    const secret = String(this.env.URANUS_PASSWORD ?? "");
+    if (!secret) {
+      return {
+        ok: false,
+        error: "这个后端部署时没设 URANUS_PASSWORD。到 Cloudflare 后台给这个 Worker 加上这条 Secret 再来。",
+      };
+    }
+    const [a, b] = await Promise.all([sha256(key), sha256(secret)]);
+    let diff = 0;
+    for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    if (diff) return { ok: false, error: "后端密钥不对。" };
+
+    const cached = this.keyCache;
+    if (cached?.mark === b && Date.now() - cached.at < 86_400_000) return { ok: true, token: cached.token };
+    let out = this.auth.login(this.auth.currentUsername(), secret);
+    if (!out.ok && (await this.resetPassword(secret))) out = this.auth.login(this.auth.currentUsername(), secret);
+    if (!out.ok) {
+      return { ok: false, error: "URANUS_PASSWORD 不合规（至少 8 位、带一个大写字母），到 Cloudflare 后台换一个。" };
+    }
+    this.keyCache = { mark: b, token: out.token, at: Date.now() };
+    return { ok: true, token: out.token };
+  }
+
+  async arm() {
+    const at = await this.ctx.storage.getAlarm();
+    if (!at || at < Date.now()) await this.ctx.storage.setAlarm(Date.now() + HEARTBEAT_MS);
+  }
+
+  async alarm() {
+    await this.ctx.storage.setAlarm(Date.now() + HEARTBEAT_MS);
+    await this.boot();
+  }
+
+  async fetch(req) {
+    const url = new URL(req.url);
+    if (this.kv.get("origin") !== url.origin) this.kv.put("origin", url.origin);
+    await this.boot();
+
+    if (url.pathname === "/hook") {
+      if (req.method !== "POST") return new Response("ok");
+      const body = new Uint8Array(await req.arrayBuffer());
+      const headers = {};
+      for (const [k, v] of req.headers) headers[k.toLowerCase()] = v;
+      // 刚醒过来时线路可能还在连：等它一会儿，别把这条推送 503 掉
+      await waitLive(15_000);
+      const r = await deliverWebhook(body, headers);
+      return new Response(r.text, { status: r.status });
+    }
+
+    if (req.method === "OPTIONS") return withCors(new Response(null, { status: 204 }), req);
+
+    if (url.pathname.startsWith("/api/") && url.pathname !== "/api/health") {
+      if (!(await verifyPass(req.headers.get("x-uranus-pass")))) {
+        return withCors(
+          Response.json(
+            { ok: false, error: "请先在 Uranus 小手机控制台登录（或者登录过期了）。", needPass: true },
+            { status: 401 }
+          ),
+          req
+        );
       }
-    }else{
-      if(b.text===undefined||!String(b.text).trim())return j({ok:false,error:"Diary text required"},400);
-      patch.text=String(b.text).trim();
     }
-    return j({ok:true,item:this.update(kind,itemId,patch)});
-  }
-  async remove(kind,itemId){
-    const arr=this.list(kind), item=arr.find(x=>x.id===itemId);
-    if(!item)return j({ok:false,error:"Not found"},404);
-    if(item.owner!=="user")return j({ok:false,error:"Only your own entries can be deleted"},403);
-    this.save(kind,arr.filter(x=>x.id!==itemId));
-    this.save("comments",this.list("comments").filter(x=>!(x.targetType===kind&&x.targetId===itemId)));
-    this.save("reactions",this.list("reactions").filter(x=>!(x.targetType===kind&&x.targetId===itemId)));
-    if(kind==="diary")this.save("highlights",this.list("highlights").filter(x=>x.diaryId!==itemId));
-    return j({ok:true});
-  }
-  async createComment(req){ const b=await this.body(req); const target=this.target(b.targetType,b.targetId);
-    if(!target||target.owner!=="character")return j({ok:false,error:"You can only comment on the character's entries"},403);
-    const x={id:id("c"),actor:"user",targetType:b.targetType,targetId:b.targetId,text:String(b.text||"").trim(),createdAt:nowIso()};
-    if(!x.text)return j({ok:false,error:"Comment required"},400);this.add("comments",x);return j({ok:true,item:x}); }
-  async createReaction(req){ const b=await this.body(req),lib=this.settings().reactionLibrary,target=this.target(b.targetType,b.targetId);
-    if(!target||target.owner!=="character")return j({ok:false,error:"You can only react to the character's entries"},403);
-    if(!String(b.emoji||"").trim()||String(b.emoji).length>80)return j({ok:false,error:"Enter a reaction (up to 80 characters)"},400);
-    let arr=this.list("reactions").filter(x=>!(x.actor==="user"&&x.targetType===b.targetType&&x.targetId===b.targetId));
-    const x={id:id("r"),actor:"user",targetType:b.targetType,targetId:b.targetId,emoji:b.emoji,createdAt:nowIso()};
-    arr.push(x);this.save("reactions",arr);return j({ok:true,item:x}); }
-  async createHighlight(req){const b=await this.body(req),diary=this.target("diary",b.diaryId);
-    if(!diary||diary.owner!=="character")return j({ok:false,error:"Only the character's diary can be highlighted"},403);
-    const x={id:id("h"),actor:"user",diaryId:diary.id,text:String(b.text||""),start:Number(b.start)||0,end:Number(b.end)||0,createdAt:nowIso()};
-    if(!x.text)return j({ok:false,error:"Text required"},400);this.add("highlights",x);return j({ok:true,item:x}); }
-  async commitSession(req){ const b=await this.body(req), actions=Array.isArray(b.actions)?b.actions:[]; if(!actions.length)return j({ok:true,empty:true}); const meaningful=actions.filter(x=>["comment","reaction","highlight","write_schedule","write_diary","update_schedule"].includes(x.type)); if(!meaningful.length)return j({ok:true,empty:true}); this.put("pending:user",[...this.get("pending:user",[]),...meaningful].slice(-30)); await this.pushBridge("user_activity",this.compactActivity(meaningful)); return j({ok:true}); }
-  compactActivity(actions){ return actions.slice(-8).map(a=>{ if(a.type==="reaction")return `${a.emoji||"reacted"} on “${String(a.targetText||"").slice(0,80)}”`; if(a.type==="comment")return `Comment on “${String(a.targetText||"").slice(0,60)}”: “${String(a.text||"").slice(0,100)}”`; if(a.type==="highlight")return `Highlighted “${String(a.text||"").slice(0,100)}”`; return String(a.summary||a.type); }).join("\n"); }
-  localDate(){return new Intl.DateTimeFormat("en-CA",{timeZone:this.settings().timezone||this.env.TZ||"America/New_York",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date());}
-  async agentRun(req){
-    const b=await this.body(req);
-    const mode=["look_schedule","write_schedule","look_diary","write_diary","autonomous"].includes(b.mode)?b.mode:"autonomous";
-    try{
-      const result=await this.callAgent(mode,b.date);
-      if(mode==="write_schedule"&&!(Array.isArray(result.schedule)&&result.schedule.some(x=>String(x.text||"").trim())))throw new Error("Model returned no schedule entry. Nothing was saved; please try again.");
-      if(mode==="write_diary"&&!String(result.diary?.text||"").trim())throw new Error("Model returned no diary entry. Nothing was saved; please try again.");
-      if((mode==="look_schedule"||mode==="look_diary")&&!(Array.isArray(result.comments)&&result.comments.length)&&!(Array.isArray(result.reactions)&&result.reactions.length))throw new Error("Loki looked, but returned no reaction or comment. Please try again.");
-      const outcome=await this.applyAgent(result,mode,b.date);
-      if(mode==="write_schedule"&&outcome.schedule===0)throw new Error("Model returned no schedule entry. Nothing was saved; please try again.");
-      if(mode==="write_diary"&&outcome.diary===0)throw new Error("Model returned no diary entry. Nothing was saved; please try again.");
-      if((mode==="look_schedule"||mode==="look_diary")&&outcome.comments+outcome.reactions===0)throw new Error("Loki did not leave a valid reaction or comment. Nothing was recorded; please try again.");
-      if(mode==="look_schedule"||mode==="look_diary"){
-        const subject=mode==="look_diary"?"diary":"schedule";
-        const details=[];
-        if(outcome.reactions)details.push(`reacted to ${outcome.reactions} ${outcome.reactions===1?"entry":"entries"}`);
-        if(outcome.comments)details.push(`commented on ${outcome.comments} ${outcome.comments===1?"entry":"entries"}`);
-        const receipt=`${this.settings().characterName} looked at your ${subject}. ${details.length?details.join(" and ")+".":"No reaction or comment."}`;
-        this.add("notifications",{id:id("n"),text:receipt,read:false,createdAt:nowIso()});
+
+    if (url.pathname === "/api/auth/login" && this.auth.mustChangeCredentials()) {
+      return withCors(
+        Response.json(
+          {
+            ok: false,
+            error:
+              "这个后端部署时没设 URANUS_PASSWORD（或者不合规：至少 8 位、带一个大写字母）。" +
+              "到 Cloudflare 后台给这个 Worker 加上这条 Secret 再来。",
+          },
+          { status: 403 }
+        ),
+        req
+      );
+    }
+
+    const headers = new Headers(req.headers);
+    const key = headers.get("x-uranus-key");
+    const bearer = /^Bearer\s+(.+)$/i.exec(headers.get("authorization") ?? "")?.[1];
+    headers.delete("cookie");
+    headers.delete("x-uranus-key");
+    headers.delete("x-uranus-pass");
+    if (key) {
+      const session = await this.keySession(key);
+      if (!session.ok) {
+        return withCors(Response.json({ ok: false, error: session.error, badKey: true }, { status: 401 }), req);
       }
-      return j({ok:true,result,applied:outcome});
-    }catch(e){return j({ok:false,error:e.message||String(e)},400);}
+      headers.set("cookie", `${COOKIE}=${encodeURIComponent(session.token)}`);
+    } else if (bearer) headers.set("cookie", `${COOKIE}=${encodeURIComponent(bearer)}`);
+
+    // 云备份（从云盘整包拉取）没做：那条路会先把包存一份在云盘上，小手机这边不管云盘
+    if (req.method === "POST" && RESTORE_PATHS.has(url.pathname)) {
+      return withCors(
+        Response.json(
+          {
+            ok: false,
+            error: "小手机不支持从云盘拉取备份。要恢复的话：用「从备份恢复」那里上传 .tar.gz 或 .json。",
+          },
+          { status: 400 }
+        ),
+        req
+      );
+    }
+
+    const res = await handleAsNodeRequest(PORT, new Request(req, { headers }));
+    return withCors(exposeToken(res), req);
   }
-  async callAgent(mode,requestedDate){
-    const s=this.settings(),profile=s.modelProfiles.find(x=>x.id===s.agent.profileId);
-    if(!profile)throw new Error("Choose a model profile in Settings first.");
-    const pending=this.get("pending:user",[]),date=/^\d{4}-\d{2}-\d{2}$/.test(requestedDate||"")?requestedDate:this.localDate();
-    const userScheduleForDate=this.list("schedule").filter(x=>x.owner==="user"&&x.date===date);
-    const userDiaryForDate=this.list("diary").filter(x=>x.owner==="user"&&x.date===date);
-    const instruction=mode==="write_schedule"?`MANDATORY: Create at least ONE nonempty schedule item in the schedule array for ${date}. You are writing YOUR OWN day, not merely looking. If uncertain, write a small believable everyday plan or activity. Do not leave schedule empty.`:mode==="write_diary"?`MANDATORY: Write a nonempty diary object {"date":"${date}","text":"..."}. Write YOUR OWN diary, even if it is just 1-2 natural sentences. Do not return null diary.`:mode==="look_schedule"?`LOOK ONLY at the user's schedule. Do NOT create schedules or diary entries. MANDATORY: leave at least ONE interaction on a USER schedule entry for TARGET DATE: either a natural comment or exactly one reaction chosen from AVAILABLE REACTIONS. You may do both. For every schedule interaction, targetType MUST be "schedule" and targetId MUST be an exact schedule id shown in ELIGIBLE TARGETS. Never return with both comments and reactions empty.`:mode==="look_diary"?`LOOK ONLY at the user's diary. Do NOT create schedules or diary entries. MANDATORY: leave at least ONE interaction on the USER diary entry for TARGET DATE: either a natural comment or exactly one reaction chosen from AVAILABLE REACTIONS. You may do both. For every diary interaction, targetType MUST be "diary" and targetId MUST be the exact diary id shown in ELIGIBLE TARGETS. Never use "schedule" for a diary interaction. Never return with both comments and reactions empty.`:`Visit naturally. You may write your own schedule/diary or interact with the USER's entries, or do nothing.`;
-    const prompt=`You are ${s.characterName}. Return ONLY valid JSON.\nMODE: ${mode}\nTARGET DATE: ${date}\nLOCAL TIMEZONE: ${s.timezone}\nCURRENT UTC: ${nowIso()}\nIMPORTANT INSTRUCTION: ${instruction}\nYou can change the status of YOUR OWN existing schedules using updates [{"id":"existing id","status":"done|failed|cancelled|changed","actualText":"required only for changed"}]. Do not edit or delete original schedule text.\nYou can ONLY comment/react to the USER's existing entries. Never comment/react to your own.\nPERSONA:\n${s.agent.persona}\nUSER:\n${s.agent.userPersona}\nWORLDBOOK:\n${s.agent.worldbook}\nSPECIAL INSTRUCTIONS:\n${s.agent.instructions}\nAVAILABLE REACTIONS: ${s.reactionLibrary.join(" ")}\nELIGIBLE TARGETS FOR THIS REQUEST:\n${mode==="look_diary"?JSON.stringify(userDiaryForDate):mode==="look_schedule"?JSON.stringify(userScheduleForDate):"n/a"}\nINTERACTION JSON SCHEMA: comments use {"targetType":"schedule|diary","targetId":"exact existing id","text":"..."}; reactions use {"targetType":"schedule|diary","targetId":"exact existing id","emoji":"one AVAILABLE REACTION"}.\nRECENT USER ACTIVITY:\n${this.compactActivity(pending)}\nYOUR SCHEDULE:\n${JSON.stringify(this.list("schedule").filter(x=>x.owner==="character").slice(-30))}\nUSER SCHEDULE:\n${JSON.stringify(this.list("schedule").filter(x=>x.owner==="user").slice(-30))}\nYOUR DIARY:\n${JSON.stringify(this.list("diary").filter(x=>x.owner==="character").slice(-7))}\nUSER DIARY:\n${JSON.stringify(this.list("diary").filter(x=>x.owner==="user").slice(-7))}\nReturn JSON shape {"schedule":[],"updates":[],"diary":null,"comments":[],"reactions":[],"summary":{"diary":"","schedule":[]},"messageNow":null}. schedule items use {"date":"${date}","time":"HH:MM or empty","end":"HH:MM or empty","text":"..."}. Comments/reactions must target existing USER entry IDs only.`;
-    const base=String(profile.baseUrl||"").replace(/\/$/,"");const path=profile.path||"/chat/completions";
-    const r=await fetch(base+path,{method:"POST",headers:{"content-type":"application/json","authorization":`Bearer ${profile.apiKey||""}`,...(profile.headers||{})},body:JSON.stringify({model:profile.model,messages:[{role:"system",content:prompt},{role:"user",content:mode.startsWith("write_")?`Write the required ${mode==="write_schedule"?"schedule":"diary"} for ${date} now. Return a nonempty result.`:mode.startsWith("look_")?`Look at the requested user content now and MUST leave at least one valid reaction or comment on it.`:"Decide what you naturally do this visit."}],...(profile.temperature===null||profile.temperature===undefined?{}:{temperature:Number(profile.temperature)}),response_format:{type:"json_object"}})});
-    const txt=await r.text();if(!r.ok)throw new Error(`Model ${r.status}: ${txt.slice(0,300)}`);
-    let data;try{data=JSON.parse(txt);}catch{throw new Error("Model returned non-JSON response envelope");}
-    const content=data.choices?.[0]?.message?.content??data.output_text??"";
-    try{return JSON.parse(content.replace(/^```json\s*|\s*```$/g,""));}catch{throw new Error("Model did not return valid action JSON");}
+
+  /**
+   * 让 Photon 把这个项目的消息推到本 Worker 的 /hook，返回验签密钥。
+   *
+   * 密钥只在创建 webhook 时给一次，所以存在 DO 里。本地没存（或者地址变了，
+   * 比如换了自定义域名）就把指向这里的旧 webhook 删了重建。
+   */
+  async ensureWebhook(projectId, projectSecret) {
+    const origin = this.kv.get("origin");
+    if (!origin) throw new Error("还不知道这个 Worker 的地址（先在浏览器里打开一次控制台）");
+    const hookUrl = `${origin}/hook`;
+    const key = `hook:${projectId}`;
+    const saved = this.kv.get(key);
+    const api = photonApi(projectId, projectSecret);
+
+    const listed = (await api("/webhooks/")) ?? [];
+    const hooks = Array.isArray(listed) ? listed : (listed.webhooks ?? []);
+    if (saved?.url === hookUrl && saved.signingSecret && hooks.some((h) => h.id === saved.id)) {
+      return saved.signingSecret;
+    }
+    for (const h of hooks.filter((h) => h.webhookUrl === hookUrl)) {
+      await api(`/webhooks/${h.id}`, { method: "DELETE" });
+    }
+    const created = await api("/webhooks/", { method: "POST", body: JSON.stringify({ webhookUrl: hookUrl }) });
+    if (!created?.signingSecret) throw new Error("Photon 建 webhook 没回签名密钥");
+    this.kv.put(key, { id: created.id, url: hookUrl, signingSecret: created.signingSecret });
+    console.log(`webhook 已指向 ${hookUrl}（项目 ${projectId}）`);
+    return created.signingSecret;
   }
-  async applyAgent(o,mode="autonomous",requestedDate){
-    if(!o||typeof o!=="object")throw new Error("Model returned invalid action data");
-    const dateNow=/^\d{4}-\d{2}-\d{2}$/.test(requestedDate||"")?requestedDate:this.localDate();
-    const outcome={schedule:0,diary:0,updates:0,comments:0,reactions:0};
-    const writeSchedule=mode==="write_schedule"||mode==="autonomous",writeDiary=mode==="write_diary"||mode==="autonomous";
-    if(writeSchedule)for(const x of (Array.isArray(o.schedule)?o.schedule:[]).slice(0,10)){
-      if(!String(x.text||"").trim())continue;
-      const item={id:id("s"),owner:"character",date:dateNow,time:String(x.time||"").slice(0,5),end:String(x.end||"").slice(0,5),text:String(x.text).trim().slice(0,1000),status:"planned",createdAt:nowIso(),updatedAt:nowIso()};
-      this.add("schedule",item);outcome.schedule++;
-    }
-    if(mode==="autonomous")for(const x of (Array.isArray(o.updates)?o.updates:[]).slice(0,12)){
-      const old=this.list("schedule").find(z=>z.id===x.id&&z.owner==="character");
-      if(!old||!["planned","done","failed","cancelled","changed"].includes(x.status))continue;
-      const actualText=String(x.actualText||"").trim();if(x.status==="changed"&&!actualText)continue;
-      this.update("schedule",old.id,{status:x.status,actualText:x.status==="changed"?actualText:""});outcome.updates++;
-    }
-    if(writeDiary&&o.diary&&String(o.diary.text||"").trim()){
-      const text=String(o.diary.text).trim().slice(0,10000);
-      const existing=this.list("diary").find(x=>x.owner==="character"&&x.date===dateNow);
-      if(!existing){this.add("diary",{id:id("d"),owner:"character",date:dateNow,text,createdAt:nowIso(),updatedAt:nowIso()});outcome.diary++;}
-      else if(mode==="write_diary")throw new Error("A diary entry already exists for this day. No overwrite was made.");
-    }
-    const forcedType=mode==="look_diary"?"diary":mode==="look_schedule"?"schedule":null;
-    const diaryTarget=mode==="look_diary"?this.list("diary").find(z=>z.owner==="user"&&z.date===dateNow):null;
-    for(const x of (Array.isArray(o.comments)?o.comments:[]).slice(0,5)){
-      const type=forcedType||x.targetType||"schedule";
-      let targetId=x.targetId;
-      let target=this.target(type,targetId);
-      if(mode==="look_diary"&&(!target||target.owner!=="user")) { target=diaryTarget; targetId=diaryTarget?.id; }
-      if(!target||target.owner!=="user"||!String(x.text||"").trim())continue;
-      this.add("comments",{id:id("c"),actor:"character",targetType:type,targetId,text:String(x.text).slice(0,500),createdAt:nowIso()});outcome.comments++;
-    }
-    for(const x of (Array.isArray(o.reactions)?o.reactions:[]).slice(0,5)){
-      const type=forcedType||x.targetType||"schedule";
-      let targetId=x.targetId;
-      let target=this.target(type,targetId);
-      if(mode==="look_diary"&&(!target||target.owner!=="user")) { target=diaryTarget; targetId=diaryTarget?.id; }
-      if(!target||target.owner!=="user"||!this.settings().reactionLibrary.includes(x.emoji))continue;
-      const arr=this.list("reactions").filter(r=>!(r.actor==="character"&&r.targetType===type&&r.targetId===targetId));
-      arr.push({id:id("r"),actor:"character",targetType:type,targetId,emoji:x.emoji,createdAt:nowIso()});this.save("reactions",arr);outcome.reactions++;
-    }
-    if(Object.values(outcome).some(Boolean)){
-      this.put("pending:user",[]);
-      const parts=[];if(outcome.schedule)parts.push(`wrote ${outcome.schedule} schedule ${outcome.schedule===1?"entry":"entries"}`);
-      if(outcome.diary)parts.push("wrote a diary entry");if(outcome.updates)parts.push(`updated ${outcome.updates} schedule status(es)`);
-      if(outcome.comments)parts.push(`left ${outcome.comments} comment(s)`);if(outcome.reactions)parts.push(`added ${outcome.reactions} reaction(s)`);
-      this.add("notifications",{id:id("n"),text:`${this.settings().characterName} ${parts.join(", ")}.`,read:false,createdAt:nowIso()});
-      const summary=[];if(o.summary?.diary)summary.push(`Diary\n${String(o.summary.diary).slice(0,280)}`);
-      if(Array.isArray(o.summary?.schedule)&&o.summary.schedule.length)summary.push(`Schedule\n${o.summary.schedule.slice(0,8).map(x=>`- ${String(x).slice(0,120)}`).join("\n")}`);
-      if(summary.length)await this.pushBridge("character_summary",summary.join("\n\n"));
-    }
-    return outcome;
-  }
-  async pushBridge(type,text){ const b=this.settings().bridge; if(!b.enabled||!b.url||!text)return; try{ await fetch(b.url,{method:"POST",headers:{"content-type":"application/json","authorization":`Bearer ${b.key||""}`},body:JSON.stringify({type,text,createdAt:nowIso()})}); }catch{} }
-  async arm(){ const s=this.settings(); if(!s.autonomy.enabled||s.autonomy.maxVisits===0){ await this.ctx.storage.deleteAlarm(); return; } const min=Math.max(10,s.autonomy.minIntervalMinutes)*60000; await this.ctx.storage.setAlarm(Date.now()+min); }
-  async alarm(){ const s=this.settings(); if(!s.autonomy.enabled||s.autonomy.maxVisits===0)return; const d=new Intl.DateTimeFormat("en-CA",{timeZone:s.timezone||this.env.TZ||"America/New_York",hour:"2-digit",minute:"2-digit",hour12:false}).format(new Date()); const [h,m]=d.split(":").map(Number), cur=h*60+m, [sh,sm]=s.autonomy.activeStart.split(":").map(Number), [eh,em]=s.autonomy.activeEnd.split(":").map(Number); if(cur>=sh*60+sm&&cur<=eh*60+em){ const key=`visits:${new Intl.DateTimeFormat("en-CA",{timeZone:s.timezone||this.env.TZ||"America/New_York",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date())}`; const count=this.get(key,0); const target=this.get(`${key}:target`,null)??Math.floor(Math.random()*(s.autonomy.maxVisits-s.autonomy.minVisits+1))+s.autonomy.minVisits; this.put(`${key}:target`,target); if(count<target){ try{await this.applyAgent(await this.callAgent("autonomous"),"autonomous"); this.put(key,count+1);}catch{} } } const min=Math.max(10,s.autonomy.minIntervalMinutes)*60000; await this.ctx.storage.setAlarm(Date.now()+min+Math.floor(Math.random()*min)); }
 }
 
-export default { async fetch(req,env){ const u=new URL(req.url); if(u.pathname.startsWith("/api/")){ const stub=env.COMPANION.get(env.COMPANION.idFromName("main")); return stub.fetch(req); } return env.ASSETS.fetch(req); } };
+function photonApi(projectId, projectSecret) {
+  const auth = `Basic ${btoa(`${projectId}:${projectSecret}`)}`;
+  return async (path, init = {}) => {
+    const r = await fetch(`${PHOTON}/projects/${projectId}${path}`, {
+      ...init,
+      headers: { authorization: auth, "content-type": "application/json", ...init.headers },
+    });
+    const text = await r.text();
+    let body;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      body = text;
+    }
+    if (!r.ok || body?.succeed === false) {
+      throw new Error(`Photon ${path} → ${r.status}: ${typeof body === "string" ? body : JSON.stringify(body)}`);
+    }
+    return body?.data;
+  };
+}
+
+async function sha256(text) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * 「重启整个服务」在这里的样子（控制台按钮、`/重启` 指令、定时重启三条路）。
+ *
+ * 桌面版是让进程退出、由启动器拉起来。这边退不了：重置 DO（ctx.abort）只会
+ * 扔掉计时器和连接，模块还缓存在同一个 isolate 里，启动流程不会重跑 —— 日记、
+ * IG、主动消息的定时器全停，比不重启还糟。
+ *
+ * 所以注册成「原地重来」：restart.js 先照旧停掉所有桥接，再调这里清缓存、
+ * 按配置把连接重新连上。定时器本来就活着，不用动。
+ */
+async function installRestart() {
+  const [{ setInProcessRestart }, { clearCaches }, { syncBridges }, { loadConfig }] = await Promise.all([
+    import("../core/server/src/restart.js"),
+    import("../core/server/src/maintenance.js"),
+    import("../core/server/src/imessage.js"),
+    import("../core/server/src/config.js"),
+  ]);
+  setInProcessRestart(async () => {
+    clearCaches("重启");
+    await syncBridges(loadConfig);
+  });
+}
+
+/** 内置的两份默认预设放进虚拟盘，桌面版第一次建 data/presets 时会从这里拷 */
+function seedPresets() {
+  for (const [name, json] of Object.entries(BUILTIN_PRESETS)) {
+    const p = `/app/assets/presets/${name}`;
+    if (!existsSync(p)) writeFileSync(p, JSON.stringify(json, null, 2));
+  }
+}
+
+/**
+ * 自带的转账 logo 放进虚拟盘（桌面版在 assets/transfer-logos/），界面上才列得出来。
+ * 内容变了就覆盖：这是随代码发的只读素材，不是用户的东西。真正画图靠的是
+ * sync-core 预渲的位图，见 shims/canvas.js。
+ */
+function seedTransferLogos() {
+  for (const [name, svg] of Object.entries(BUILTIN_TRANSFER_LOGOS)) {
+    const p = `/app/assets/transfer-logos/${name}`;
+    let old = null;
+    try {
+      old = String(readFileSync(p, "utf-8"));
+    } catch {
+      // 第一次启动还没有
+    }
+    if (old !== svg) writeFileSync(p, svg);
+  }
+}
+
+/** 登录 / 改密码时桌面版回的 Set-Cookie 翻成 x-uranus-token 头 */
+function exposeToken(res) {
+  const set = res.headers.get("set-cookie");
+  if (!set) return res;
+  const m = new RegExp(`${COOKIE}=([^;]*)`).exec(set);
+  if (!m) return res;
+  const out = new Response(res.body, res);
+  out.headers.delete("set-cookie");
+  out.headers.set("x-uranus-token", decodeURIComponent(m[1]));
+  return out;
+}
+
+function withCors(res, req) {
+  const out = new Response(res.body, res);
+  out.headers.set("access-control-allow-origin", req.headers.get("origin") || "*");
+  out.headers.set("vary", "origin");
+  out.headers.set("access-control-allow-methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+  out.headers.set(
+    "access-control-allow-headers",
+    req.headers.get("access-control-request-headers") || "authorization, content-type"
+  );
+  out.headers.set("access-control-expose-headers", "x-uranus-token, content-disposition");
+  out.headers.set("access-control-max-age", "86400");
+  return out;
+}
+
+export default {
+  fetch(req, env) {
+    return env.URANUS.get(env.URANUS.idFromName("main")).fetch(req);
+  },
+};
