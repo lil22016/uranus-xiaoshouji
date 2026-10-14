@@ -770,6 +770,29 @@ function fillDiaryPrompt(cfg, fill) {
 }
 
 /**
+ * 日记提示词里 `language: "xxx"`（或 `output_language: "xxx"`）写的不是中文时，
+ * 在整条消息的**最后**再补一句「全文必须用 xxx」。
+ *
+ * 为什么要放最后：这条消息是一整段，顶部是提示词、底部是一大堆中文的聊天流水，
+ * 再加上近 N 天记忆和上一篇日记（也是中文）。模型会顺着最近、最多的语言走，
+ * 提示词顶部那一行 `language: "English"` 压不住。末尾补一句，
+ * 才压得住。写中文（或没写这一行）时什么都不加，行为和以前完全一样。
+ */
+export function diaryLanguageNote(promptText) {
+  const m = /^[ \t-]*(?:output_)?language\s*:\s*["']?([^"'\r\n]+?)["']?\s*$/im.exec(
+    String(promptText ?? "")
+  );
+  const lang = m?.[1]?.trim();
+  if (!lang || /中文|汉语|漢語|chinese|zh/i.test(lang)) return "";
+  return (
+    `【最终要求·输出语言】这篇日记的全文（包括结尾的 To-do list 和它的标题）必须使用「${lang}」书写。` +
+    `即使上面的聊天记录、人设、记忆、旧日记是别的语言，也一律用「${lang}」，不要夹杂其他语言。\n` +
+    `FINAL REQUIREMENT: write the ENTIRE diary, including the To-do list and its heading, in ${lang}. ` +
+    `Do not switch to any other language even if the chat log, memories or previous diaries are in another language.`
+  );
+}
+
+/**
  * 生成日记的消息，顺序照用户的规范：
  *
  *   日记提示词项目（顶部必须是这个）
@@ -838,6 +861,7 @@ export function buildDiaryMessages(config, role, key, opts = {}) {
       wrap("当前天气", b.fill(opts.weather ?? "")),
       wrap("字数要求", words),
       wrap(`${role?.name || "char"}_diary_log`, log),
+      diaryLanguageNote(cfg.prompt),
     ])
   );
 }
