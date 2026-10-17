@@ -4074,7 +4074,7 @@ app.get("/api/health", (_req, res) => {
   // port / igPort 是给前端算「另一个页面在哪」用的：IG 页右上角那些「去控制台
   // 设置」的链接要拼出控制台的地址，而它只知道自己被开在哪个端口上。
   // 这两个常量声明在下面，但这个回调要等有请求才跑，那时早过了 TDZ
-  res.json({ ok: true, service: "uranus-imessage", port: PORT, igPort: IG_PORT || null });
+  res.json({ ok: true, service: "uranus-imessage", port: PORT, igPort: IG_PORT || null, diaryFixDates: true });
 });
 
 const PORT = Number(process.env.PORT) || 8787;
