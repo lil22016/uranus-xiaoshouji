@@ -433,23 +433,37 @@ function scheduleMs(schedule) {
  *
  * 错误存下来是给界面用的：定时日记在后台跑，失败时用户不在现场。
  */
-function markDiaryDone(key) {
-  saveState(key, { lastDiaryAt: new Date().toISOString(), lastError: "", lastErrorAt: "" });
+function markDiaryDone(key, at = new Date().toISOString()) {
+  saveState(key, { lastDiaryAt: at, lastError: "", lastErrorAt: "" });
 }
 
 /** 只推时间戳（流水是空的那种「这次不用写」）。 */
-function pushDiaryTime(key) {
-  saveState(key, { lastDiaryAt: new Date().toISOString() });
+function pushDiaryTime(key, at = new Date().toISOString()) {
+  saveState(key, { lastDiaryAt: at });
 }
 
-function markDiaryError(key, why, { pushTime = false } = {}) {
+function markDiaryError(key, why, { pushTime = false, at } = {}) {
   const now = new Date().toISOString();
   saveState(key, {
     // 留够长度：中转站的 400 常把真正的原因写在很后面，截短了等于让用户猜
     lastError: String(why ?? "").slice(0, 2000),
     lastErrorAt: now,
-    ...(pushTime ? { lastDiaryAt: now } : {}),
+    ...(pushTime ? { lastDiaryAt: at ?? now } : {}),
   });
+}
+
+/**
+ * 定时日记记的「上次时间」取**这一轮本该到点的那一刻**，不取写完的那一刻。
+ *
+ * 以前记的是写完的时间：每次晚一分钟检查 + 生成要几十秒 + 失败了往后推，
+ * 「每 1 天一篇」就一天天往后漂，22:00 漂到过了零点，日记文件名就跟着
+ * 落到了第二天（2026-10 用户看到的 14 号日记在 15 号）。按到点时刻记就不漂了。
+ * 机器睡过好几轮的情况：取最近一个已经过去的到点时刻，不补写。
+ */
+function dueAnchor(key, every, now) {
+  const last = Date.parse(readDiaryState(key)?.lastDiaryAt ?? "");
+  if (!Number.isFinite(last) || !every || now - last < every) return new Date(now).toISOString();
+  return new Date(last + Math.floor((now - last) / every) * every).toISOString();
 }
 
 function saveState(key, patch) {
@@ -515,10 +529,11 @@ async function tickDiaries(getConfig, notify) {
   for (const role of config?.roles ?? []) {
     const key = memoryKeyFor(role);
     if (!diaryDue(config, role, key, now)) continue;
+    const anchor = dueAnchor(key, scheduleMs(config?.memories?.diary?.schedule), now);
 
     if (!readDiaryLog(key).trim()) {
       // 时间戳往后推，免得每分钟来一次。这不算失败，所以不碰 lastError
-      pushDiaryTime(key);
+      pushDiaryTime(key, anchor);
       logInfo("记忆库", `${key} 到点该写日记了，但流水是空的，跳过这一次`);
       continue;
     }
@@ -535,7 +550,7 @@ async function tickDiaries(getConfig, notify) {
     try {
       const weather = await diaryWeather(config, role);
       const out = await generateDiary(config, role, key, { weather });
-      markDiaryDone(key);
+      markDiaryDone(key, anchor);
       logInfo("记忆库", `${key} 的定时日记写好了：${out.file}（${out.text.length} 字）`);
       if (notify) await notify(role, `📔 我写了一篇日记（${out.file}）。`).catch(() => {});
     } catch (e) {
@@ -547,7 +562,7 @@ async function tickDiaries(getConfig, notify) {
        * 代价是这一轮的内容要等到下一个间隔才写 —— 但流水**一个字节都没删**，
        * 下次连着一起写，什么都不会丢。
        */
-      markDiaryError(key, why, { pushTime: true });
+      markDiaryError(key, why, { pushTime: true, at: anchor });
       logError("记忆库", `${key} 的定时日记失败（流水没删，下个间隔再试）`, e);
       if (notify) {
         await notify(role, `⚠️ 这篇定时日记没写成：${why}\n聊天流水一条都没删。`).catch(() => {});

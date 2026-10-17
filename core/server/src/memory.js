@@ -713,19 +713,26 @@ export async function summarizeMemo(config, role, key, now = new Date()) {
    */
   const LEAN_FLOOR = 6;
   const LEAN_RATIO = 0.6;
-  const lineCount = (s) => String(s ?? "").split("\n").filter((l) => l.trim()).length;
-  const before = lineCount(readMemo(key));
-  const after = lineCount(text);
-  if (before >= LEAN_FLOOR && after < Math.ceil(before * LEAN_RATIO)) {
+  const old = readMemo(key);
+  const before = memoEntries(old).length;
+  // 闸只拿「本来就该留下的」条目来比：上一版已经标了「已完成 / 已过时 /
+  // 下次更新会删除」的条目，提示词明确叫模型这一轮删掉；它们照算的话，
+  // 旧清单里攒了一堆待删项时，模型每次**按规矩**删，闸就每次判它「漏了」，
+  // 备忘录永远更新不了、待删项也永远删不掉（2026-10 用户撞上的就是这个死循环）
+  const keep = memoEntries(old).filter((l) => !MEMO_DONE.test(l)).length;
+  const after = memoEntries(text).length;
+  if (keep >= LEAN_FLOOR && after < Math.ceil(keep * LEAN_RATIO)) {
     // 这一版不写盘，所以正文只剩日志这一个去处 —— 用户要能核对「到底是模型漏了
     // 还是它合并得挺好、是这道闸判严了」，不记下来就只剩一句抽象的失败提示
     logWarn(
       "记忆库",
-      `${key} 的备忘录这一版从 ${before} 条缩到 ${after} 条，没有覆盖。模型这次写的全文如下`,
+      `${key} 的备忘录这一版从 ${before} 条（其中该留的 ${keep} 条）缩到 ${after} 条，没有覆盖。模型这次写的全文如下`,
       text
     );
     throw new Error(
-      `模型这一版备忘录只剩 ${after} 条，原来有 ${before} 条 —— 像是把旧条目漏掉了，` +
+      `模型这一版备忘录只剩 ${after} 条，原来有 ${before} 条` +
+        (keep < before ? `（去掉标了已完成 / 待删除的，该留的有 ${keep} 条）` : "") +
+        ` —— 像是把旧条目漏掉了，` +
         `所以没有覆盖。待总结的对话还留着，下一轮会再试一次（这一版的全文在控制台日志里）`
     );
   }
@@ -734,6 +741,20 @@ export async function summarizeMemo(config, role, key, now = new Date()) {
   commitPending("memo", key);
   logInfo("记忆库", `${key} 备忘录更新了（${text.length} 字、${after} 条）`);
   return { content: text };
+}
+
+/** 上一版里已经标了「这一轮该删」的条目：完成了、过时了、取消了，或者干脆写着下次会删。 */
+const MEMO_DONE = /下次更新[^\n]{0,12}删除|会删除该项|[（(]\s*已(?:完成|解决|过时|过期|取消|结束|购买|办好|处理)/;
+/** 末尾那行「更新时间：…」每版都有，不算条目。 */
+const MEMO_STAMP = /^\s*更新时间\s*[:：]/;
+/**
+ * 备忘录里的「条目」。有「1. 」这种编号就按编号数（模型把一条拆成两行、
+ * 或者在条目下面缩进补一句时，按行数会多算）；一个编号都没有才退回按行数。
+ */
+function memoEntries(s) {
+  const lines = String(s ?? "").split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !MEMO_STAMP.test(l));
+  const numbered = lines.filter((l) => /^\d+\s*[.、．)]/.test(l));
+  return numbered.length ? numbered : lines;
 }
 
 /* ---------------- 日记 ---------------- */
@@ -929,11 +950,32 @@ export async function generateDiary(config, role, key, opts = {}) {
     );
   }
 
-  const file = writeDiary(key, localDate(now), text);
+  const file = writeDiary(key, diaryDayOf(log, now), text);
   // 写成了才清流水，而且清之前先备份。上面任何一条 throw 都走不到这里
   commitDiaryLog(key);
   logInfo("记忆库", `${key} 生成了一篇日记 ${file}（${text.length} 字，打了 ${tries + 1} 次）`);
   return { file, text, tries: tries + 1 };
+}
+
+/**
+ * 这篇日记属于哪一天：看流水**最后一条**消息的日期（日记提示词也规定以它为准，
+ * 日记顶部的时间栏就是它），而不是「生成的那一刻」。
+ *
+ * 以前用生成时刻：定时日记过了零点才跑（00:41），14 号的日记就叫
+ * 2026-10-15.md。最后一条在凌晨 05:00 前的，算前一天 —— 熬夜聊过零点，
+ * 还是前一天的日记。流水里一行带日期的都没有，才退回生成时刻。
+ */
+export function diaryDayOf(log, now = new Date()) {
+  const lines = String(log ?? "").split(/\r?\n/);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})\s+\S+\s+(\d{2}):\d{2}/.exec(lines[i].trim());
+    if (!m) continue;
+    const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+    if (Number(m[4]) < 5) d.setDate(d.getDate() - 1);
+    // 防呆：算出来比生成时刻还晚（时钟被改过之类）就不信它
+    return d > now ? localDate(now) : localDate(d);
+  }
+  return localDate(now);
 }
 
 /**

@@ -99,8 +99,10 @@ import {
   manualMemory,
   startDiaryTimer,
 } from "./memoryhooks.js";
+import { applyDiaryDates, planDiaryDates } from "./diaryfix.js";
 import {
   appendMemory,
+  diaryDirFor,
   listDiaries,
   localDate,
   memoryKeyFor,
@@ -3121,6 +3123,33 @@ app.post("/api/memories/:key/diary", (req, res) => {
 });
 
 /** 一篇成品日记的正文。文件名在 `readDiary` 里过 DIARY_FILE 正则。 */
+/**
+ * 修正日记日期：以前按「生成时刻」命名的日记（零点后才生成，14 号的叫 15 号），
+ * 按日记顶部的时间栏挪回它写的那一天。规则见 diaryfix.js。
+ *
+ * body `{ apply: false }`（默认）只出计划；`{ apply: true }` 才改名，改之前把这个
+ * 角色的日记全部备份到 memories/日记备份/改日期-<时间>/<角色>/。
+ * 小手机版没有能打开的文件夹，只能走这里（界面：记忆库 → 日记 → 修正日记日期）。
+ */
+app.post("/api/memories/:key/diary-fix-dates", (req, res) => {
+  const ctx = memoryCtx(req, res);
+  if (!ctx) return;
+  const dir = diaryDirFor(ctx.key);
+  if (!dir) return res.status(400).json({ ok: false, error: "这个角色的记忆库路径不合法" });
+  try {
+    const plan = planDiaryDates(dir);
+    if (!req.body?.apply) return res.json({ ok: true, plan, moved: 0 });
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const backup = path.join(path.dirname(dir), "..", "日记备份", `改日期-${stamp}`, path.basename(dir));
+    const r = applyDiaryDates(dir, plan, backup);
+    if (r.moved) logInfo("记忆库", `${ctx.key} 修正了 ${r.moved} 篇日记的日期，原文件备份在 ${r.backup}`);
+    res.json({ ok: true, plan, moved: r.moved, backup: r.backup, stats: statsFor(ctx.key) });
+  } catch (e) {
+    logError("记忆库", `${ctx.key} 修正日记日期失败`, e);
+    res.status(500).json({ ok: false, error: String(e?.message ?? e) });
+  }
+});
+
 app.get("/api/memories/:key/diary/:file", (req, res) => {
   const ctx = memoryCtx(req, res);
   if (!ctx) return;
