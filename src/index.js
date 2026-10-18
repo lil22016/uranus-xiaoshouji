@@ -180,8 +180,14 @@ export class Uranus extends DurableObject {
       const headers = {};
       for (const [k, v] of req.headers) headers[k.toLowerCase()] = v;
       // 刚醒过来时线路可能还在连：等它一会儿，别把这条推送 503 掉
-      await waitLive(15_000);
-      const r = await deliverWebhook(body, headers);
+      let r;
+      try {
+        await waitLive(15_000);
+        r = await deliverWebhook(body, headers);
+      } catch (e) {
+        r = { status: 500, text: String(e?.message ?? e) };
+      }
+      if (r.status >= 400) void this.hookFailed(r).catch(() => {});
       return new Response(r.text, { status: r.status });
     }
 
@@ -245,6 +251,45 @@ export class Uranus extends DurableObject {
 
     const res = await handleAsNodeRequest(PORT, new Request(req, { headers }));
     return withCors(exposeToken(res), req);
+  }
+
+  /**
+   * Photon 推来了一条消息，但没能交给 Uranus。
+   *
+   * 以前这几种情况只回 Photon 一个状态码，Uranus 的控制台里一个字都没有 ——
+   * 对方发了消息、角色毫无反应、日志一片空白，完全没法查。现在：
+   *  - 在控制台说一声是哪种情况；
+   *  - 自己修：没有在线的线路（503）就把连接重启一遍；验签过不去（401，存的
+   *    签名密钥和 Photon 那边对不上）就删掉存的 webhook、重启，让它重新登记一个。
+   *    修复限流，免得一阵推送连着触发。
+   */
+  async hookFailed(r) {
+    const { logWarn, logError } = await import("../core/server/src/logs.js");
+    const why =
+      r.status === 503
+        ? "现在没有在线的 iMessage 线路"
+        : r.status === 401
+          ? "验签没过（存的 webhook 签名密钥和 Photon 那边对不上）"
+          : `处理出错（${r.status}）：${String(r.text).slice(0, 200)}`;
+    logWarn("桥接", `收到一条 Photon 推送，但没交给 Uranus：${why}`);
+
+    const now = Date.now();
+    const gap = r.status === 401 ? 10 * 60_000 : 2 * 60_000;
+    if (now - (this.lastHeal ?? 0) < gap) return;
+    this.lastHeal = now;
+    try {
+      if (r.status === 401) {
+        for (const [k] of this.kv.list({ prefix: "hook:" })) this.kv.delete(k);
+      }
+      const [{ restartBridges }, { loadConfig }] = await Promise.all([
+        import("../core/server/src/imessage.js"),
+        import("../core/server/src/config.js"),
+      ]);
+      logWarn("桥接", r.status === 401 ? "重新登记 webhook 并重连线路…" : "重连线路…");
+      await restartBridges(loadConfig);
+    } catch (e) {
+      logError("桥接", "自动修复收消息失败", e);
+    }
   }
 
   /**

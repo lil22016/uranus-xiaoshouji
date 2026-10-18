@@ -617,16 +617,26 @@ function effectHintOf(message, scope) {
   }
 
   const formatting = Array.isArray(message?.formatting) ? message.formatting : [];
+  if (formatting.length || message?.expressiveSendStyleId) {
+    let raw = "";
+    try {
+      raw = JSON.stringify({ expressiveSendStyleId: message?.expressiveSendStyleId ?? null, formatting }).slice(0, 600);
+    } catch {
+      raw = "(无法序列化)";
+    }
+    logInfo(scope, `这条消息带了格式/效果：${raw}`);
+  }
   for (const item of formatting) {
-    const name = String(item?.effectName ?? "").trim();
-    if (!name) continue;
+    const rawName = String(item?.effectName ?? item?.effect ?? item?.textEffect ?? "").trim();
+    if (!rawName) continue; // 粗体/斜体之类没有 effectName，照旧不要
+    const name = wordEffectKey(rawName);
     const label = WORD_EFFECT_LABELS[name];
     if (!label) {
-      logDebug(scope, `不认识的逐词效果 effectName=${name}，这条先忽略`);
+      logInfo(scope, `不认识的逐词效果 effectName=${rawName}，这条先忽略`);
       continue;
     }
-    const start = Number(item?.start);
-    const length = Number(item?.length);
+    const start = Number(item?.start ?? item?.range?.location ?? item?.location);
+    const length = Number(item?.length ?? item?.range?.length);
     if (!Number.isFinite(start) || !Number.isFinite(length) || length <= 0) continue;
     const piece = native.slice(start, start + length).trim();
     if (!piece) continue;
@@ -635,6 +645,54 @@ function effectHintOf(message, scope) {
 
   if (!notes.length) return "";
   return `[系统提示:{{user}}${notes.join("；")}。]`;
+}
+
+/**
+ * 逐词效果名归一："big"、"Big"、"enlarge"、"kIMTextEffectBig" 之类统一成
+ * WORD_EFFECT_LABELS 的键。
+ */
+const WORD_EFFECT_ALIASES = { enlarge: "big", large: "big", bigger: "big", grow: "big", shrink: "small", smaller: "small", tiny: "small" };
+function wordEffectKey(raw) {
+  const k = String(raw)
+    .replace(/^_+/, "")
+    .replace(/^k?IMTextEffect(Type)?/i, "")
+    .replace(/^TextEffect(Type)?/i, "")
+    .replace(/Effect$/i, "")
+    .toLowerCase();
+  return WORD_EFFECT_ALIASES[k] || k;
+}
+
+/**
+ * 推送里没带效果信息时，按 id 把这条消息完整取一次再看。webhook 推来的那份
+ * 是删减过的（语音条的字节也是这样补的，见 shims/spectrum.js）。最多等 3 秒。
+ */
+async function effectHintRefetched(space, message, scope) {
+  if (!message?.id || typeof space?.getMessage !== "function") return "";
+  let timer;
+  try {
+    const full = await Promise.race([
+      space.getMessage(message.id),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(null), 3000);
+      }),
+    ]);
+    if (!full) return "";
+    const merged = {
+      nativeText: message.nativeText ?? full.nativeText ?? full.content?.text ?? "",
+      expressiveSendStyleId: full.expressiveSendStyleId ?? full.content?.expressiveSendStyleId ?? null,
+      formatting: full.formatting ?? full.content?.formatting ?? [],
+    };
+    const hint = effectHintOf(merged, scope);
+    if (!hint) {
+      logDebug(scope, `取回的完整消息上也没有效果信息（字段：${Object.keys(full).join("/")}）`);
+    }
+    return hint;
+  } catch (e) {
+    logDebug(scope, `按 id 取回消息失败：${String(e?.message ?? e)}`);
+    return "";
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** 引原文时统一的截断：超了掐掉加省略号，只是用来指认「哪一句」。 */
@@ -7652,9 +7710,44 @@ async function startRunner(getConfig, project, meta, retries = 0) {
      */
     rehydrateTransferReminders(getConfig, runner);
 
+    /*
+     * 卡住检测。消息是一条一条串行处理的：某一条卡在某个 await 上不动，后面的
+     * 就全排在它后面，不报错也不打日志 —— 实机遇到过「主动消息照发、对方发
+     * 什么都没反应、控制台一片空白」。每 15 秒看一眼，一条处理了 30 秒还没完
+     * 就在控制台说一声卡在哪一步。
+     */
+    runner.busySince = 0;
+    runner.busyStep = "";
+    const stallTimer = setInterval(() => {
+      if (runner.stopped) return clearInterval(stallTimer);
+      if (!runner.busySince) return;
+      const secs = Math.round((Date.now() - runner.busySince) / 1000);
+      if (secs >= 30 && !runner.busyWarned) {
+        runner.busyWarned = true;
+        logWarn(scope, `一条消息已经处理了 ${secs} 秒还没完（卡在：${runner.busyStep || "未知"}），后面的消息都在排队`);
+      }
+    }, 15000);
+    stallTimer.unref?.();
+    const step = (name) => {
+      runner.busyStep = name;
+    };
+
     (async () => {
       try {
         for await (const [space, message] of instance.messages) {
+          runner.busySince = Date.now();
+          runner.busyWarned = false;
+          step("开始处理");
+          /*
+           * 推过来什么都先记一行（已读回执除外，太频繁）。以前被过滤掉的消息
+           * 一个字都不留，「发了没反应」时分不清是没推过来还是推过来被扔了。
+           */
+          if (message?.content?.type !== "read") {
+            logInfo(
+              scope,
+              `收到推送：${message?.content?.type ?? typeof message?.content}（direction=${message?.direction ?? "?"}，platform=${message?.platform ?? "?"}）`
+            );
+          }
           /*
            * 「这条消息拆完了」的收尾，**声明在 try 外面**：下面 catch 里也要调
            * （拆到一半崩了同样得放掉合并窗口），而 try 块里的 const 在 catch 里
@@ -7664,7 +7757,10 @@ async function startRunner(getConfig, project, meta, retries = 0) {
           try {
             if (runner.stopped) break; // 这条连接已经被换掉了
             if (message.direction === "outbound") continue; // 忽略自己发的
-            if (message.platform !== platformId) continue; // 非当前 provider
+            if (message.platform !== platformId) {
+              logWarn(scope, `这条推送的 platform=${message.platform}，和当前的 ${platformId} 对不上，跳过`);
+              continue; // 非当前 provider
+            }
             if (message.id && runner.seen.has(message.id)) continue; // 去重
 
             const spaceId = message.space?.id ?? message.sender?.id ?? "unknown";
@@ -7880,6 +7976,7 @@ async function startRunner(getConfig, project, meta, retries = 0) {
              * 不联网也不花时间；只有真碰上卡片才会去底层 gRPC 问一次详情，
              * 所以项目凭据只在云端模式给（本地 Mac 模式没有 Photon 可问）。
              */
+            step("读卡片详情");
             const cardHint = await cardHintFor(message, {
               projectId: runner.mode === "cloud" ? project.projectId : "",
               projectSecret: runner.mode === "cloud" ? project.projectSecret : "",
@@ -8487,7 +8584,7 @@ async function startRunner(getConfig, project, meta, retries = 0) {
                 images: linkImageUrls,
                 videos: linkVideoUrls,
                 covers: linkCoverUrls,
-              } = await renderLinks(userText, linkScope);
+              } = await (step("解析链接"), renderLinks(userText, linkScope));
 
               /*
                * 链接里的视频（抖音视频作品，够短的那些）走识视频那条路。
@@ -8587,7 +8684,11 @@ async function startRunner(getConfig, project, meta, retries = 0) {
              * 没带任何效果时 effectHintOf 返回空串，这里就不占一条 —— 绝大多数
              * 消息都是这种，不能让每条消息后面都拖一句废话。
              */
-            const effectHint = userText ? effectHintOf(message, scope) : "";
+            let effectHint = userText ? effectHintOf(message, scope) : "";
+            if (userText && !effectHint) {
+              step("取完整消息看效果");
+              effectHint = await effectHintRefetched(space, message, scope);
+            }
             if (effectHint) {
               enqueue(getConfig, runner, space, spaceId, { text: effectHint, message }, peer);
             }
@@ -8607,7 +8708,17 @@ async function startRunner(getConfig, project, meta, retries = 0) {
             // 还没走到 holdPending 就崩的（过滤、取 spaceId 那一段）这里还是
             // null，`?.` 正好跳过 —— 那时候压根没占过窗口
             doneUnpacking?.();
+          } finally {
+            // continue 跳过的、正常处理完的、崩了的，都在这儿收尾（卡住检测靠它）
+            runner.busySince = 0;
           }
+        }
+        // 消息流自己结束了（不是我们停的）：当断线处理，别悄悄躺平
+        if (!runner.stopped) {
+          logWarn(scope, "消息流自己结束了，按断线处理，准备重连");
+          runner.status = "error";
+          runner.error = "消息流结束了";
+          scheduleRetry(getConfig, runner, new Error("消息流结束了"));
         }
       } catch (err) {
         if (runner.stopped) return; // 主动停掉时流会断，这不算错

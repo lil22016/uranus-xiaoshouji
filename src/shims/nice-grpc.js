@@ -98,6 +98,37 @@ function fail(path, code, message, md, options) {
 }
 
 /**
+ * 一元调用最多等多久。
+ *
+ * 以前这里完全不认超时：SDK 给的 deadline / timeout 没人管，网关一次不回，
+ * fetch 就永远挂着。收消息是一条条串行处理的，一条卡在这儿，后面的就全排在
+ * 它后面 —— 实机表现是「主动消息照发，对方发什么都没反应，日志一片空白」
+ * （DO 靠 alarm 一直醒着，所以会一直卡下去）。流式调用不设默认上限。
+ */
+const UNARY_MAX_MS = 60_000;
+
+/** 把调用方的 signal、deadline / timeout、一元调用的默认上限合成一个 signal */
+function callSignal(method, options) {
+  const parts = [];
+  if (options.signal) parts.push(options.signal);
+  let ms = null;
+  if (options.deadline != null) {
+    const at = options.deadline instanceof Date ? options.deadline.getTime() : Number(options.deadline);
+    if (Number.isFinite(at)) ms = at - Date.now();
+  } else if (options.timeout != null && Number.isFinite(Number(options.timeout))) {
+    ms = Number(options.timeout);
+  }
+  if (!method.responseStream) ms = Math.min(ms ?? UNARY_MAX_MS, UNARY_MAX_MS);
+  let timer = null;
+  if (ms != null) {
+    timer = AbortSignal.timeout(Math.max(1, ms));
+    parts.push(timer);
+  }
+  const signal = parts.length > 1 ? AbortSignal.any(parts) : parts[0];
+  return { signal, timer, ms };
+}
+
+/**
  * 发一次调用，把响应体按帧吐出来（消息帧 decode 之后 yield）。
  * 一元调用和服务端流式共用：一元的取第一个就行。
  */
@@ -112,11 +143,14 @@ async function* invoke(channel, method, request, options) {
     if (vs.length) headers[k] = vs.join(", ");
   }
   const body = frame(method.requestSerialize(request));
+  const { signal, timer, ms } = callSignal(method, options);
+  const timedOut = () => timer?.aborted && !options.signal?.aborted;
 
   let res;
   try {
-    res = await fetch(channel.base + path, { method: "POST", headers, body, signal: options.signal });
+    res = await fetch(channel.base + path, { method: "POST", headers, body, signal });
   } catch (e) {
+    if (timedOut()) throw fail(path, Status.DEADLINE_EXCEEDED, `网关 ${Math.round(ms / 1000)} 秒没回应`, Metadata(), options);
     if (options.signal?.aborted) throw fail(path, Status.CANCELLED, "调用被取消", Metadata(), options);
     throw fail(path, Status.UNAVAILABLE, `连不上网关：${e?.message ?? e}`, Metadata(), options);
   }
@@ -152,7 +186,14 @@ async function* invoke(channel, method, request, options) {
         if (flag & 0x80) trailers = parseTrailerFrame(payload);
         else yield method.responseDeserialize(payload);
       }
-      const { done, value } = await reader.read();
+      let chunk;
+      try {
+        chunk = await reader.read();
+      } catch (e) {
+        if (timedOut()) throw fail(path, Status.DEADLINE_EXCEEDED, `网关 ${Math.round(ms / 1000)} 秒没把响应发完`, Metadata(), options);
+        throw e;
+      }
+      const { done, value } = chunk;
       if (done) break;
       const next = new Uint8Array(buf.length + value.length);
       next.set(buf);
@@ -160,6 +201,8 @@ async function* invoke(channel, method, request, options) {
       buf = next;
     }
   } finally {
+    // 一元调用拿到第一条就返回了，剩下的响应体关掉，别留着连接
+    reader.cancel?.().catch(() => {});
     reader.releaseLock?.();
   }
 
