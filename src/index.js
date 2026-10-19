@@ -188,7 +188,7 @@ export class Uranus extends DurableObject {
         r = { status: 500, text: String(e?.message ?? e) };
       }
       void this.hookSeen(body, headers, r).catch(() => {});
-      if (r.status >= 400) void this.hookFailed(r).catch(() => {});
+      if (r.status >= 400) void this.hookFailed(r, headers).catch(() => {});
       return new Response(r.text, { status: r.status });
     }
 
@@ -290,8 +290,25 @@ export class Uranus extends DurableObject {
    *    签名密钥和 Photon 那边对不上）就删掉存的 webhook、重启，让它重新登记一个。
    *    修复限流，免得一阵推送连着触发。
    */
-  async hookFailed(r) {
-    const { logWarn, logError } = await import("../core/server/src/logs.js");
+  async hookFailed(r, headers = {}) {
+    const { logWarn, logError, logInfo } = await import("../core/server/src/logs.js");
+    /*
+     * 验签没过、而且推送带的 webhook id 不是我们现在登记的任何一个：多半是换了
+     * Photon 项目之后，旧项目那条还指着这里的 webhook。那不是故障，别为它重连。
+     */
+    if (r.status === 401) {
+      const hookId = headers["x-spectrum-webhook-id"] || "";
+      const known = [];
+      try {
+        for (const [, v] of this.kv.list({ prefix: "hook:" })) if (v?.id) known.push(v.id);
+      } catch {
+        /* 读不到就按未知处理 */
+      }
+      if (hookId && known.length && !known.includes(hookId)) {
+        logInfo("桥接", `收到一条来自旧 webhook（id ${hookId}）的推送，不是现在这个项目的，忽略。想清掉的话去 Photon 旧项目的 Webhook 页删掉它`);
+        return;
+      }
+    }
     const why =
       r.status === 503
         ? "现在没有在线的 iMessage 线路"
