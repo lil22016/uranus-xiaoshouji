@@ -262,22 +262,23 @@ export class Uranus extends DurableObject {
    * 分不出来。
    */
   async hookSeen(body, headers, r) {
-    const { logInfo, logWarn } = await import("../core/server/src/logs.js");
+    /*
+     * 只记 debug。「交出去几条」这里数不准：SDK 先回 200、之后才把消息交给回调，
+     * 在这儿读计数永远是 0 —— 之前据此报「被丢了」全是假警报（同一毫秒里消息
+     * 循环那边已经记了「收到推送」）。真出问题（验签不过、没有在线线路、出错）
+     * 由 hookFailed 报警。
+     */
+    const { logDebug } = await import("../core/server/src/logs.js");
     let event = headers["x-spectrum-event"] || "?";
     let ctype = "?";
     try {
       const j = JSON.parse(new TextDecoder().decode(body));
       event = j?.event ?? event;
-      ctype = j?.message?.content?.type ?? (Array.isArray(j?.messages) ? `批量 ${j.messages.length} 条` : "?");
+      ctype = j?.message?.content?.type ?? "?";
     } catch {
       /* 不是 JSON 就算了 */
     }
-    const line = `收到 Photon 推送（event=${event}，内容=${ctype}，${body.length} 字节）→ ${r.status}，交给 Uranus ${r.delivered ?? 0} 条`;
-    if (r.status < 400 && !r.delivered) {
-      logWarn("桥接", `${line}。SDK 回了成功却没解出任何消息，这条被丢了（推送格式可能变了）`);
-    } else {
-      logInfo("桥接", line);
-    }
+    logDebug("桥接", `收到 Photon 推送（event=${event}，内容=${ctype}，${body.length} 字节）→ ${r.status}`);
   }
 
   /**
