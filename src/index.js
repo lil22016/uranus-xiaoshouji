@@ -343,7 +343,14 @@ export class Uranus extends DurableObject {
     } catch {
       /* 日志失败不影响登记 */
     }
-    if (saved?.url === hookUrl && saved.signingSecret && hooks.some((h) => h.id === saved.id)) {
+    /*
+     * 一次性重登记：地址对、列表里也有，Photon 却一条都不推（控制台连「收到 Photon
+     * 推送」都没有）。删掉重建一次，排除 Photon 那边这条登记本身坏了的可能。
+     * 换了 HOOK_RESET 的值才会再来一次。
+     */
+    const HOOK_RESET = "2026-10-18";
+    const fresh = this.kv.get("hookReset") === HOOK_RESET;
+    if (fresh && saved?.url === hookUrl && saved.signingSecret && hooks.some((h) => h.id === saved.id)) {
       return saved.signingSecret;
     }
     for (const h of hooks.filter((h) => h.webhookUrl === hookUrl)) {
@@ -357,7 +364,13 @@ export class Uranus extends DurableObject {
     const created = await api("/webhooks/", { method: "POST", body: JSON.stringify({ webhookUrl: hookUrl }) });
     if (!created?.signingSecret) throw new Error("Photon 建 webhook 没回签名密钥");
     this.kv.put(key, { id: created.id, url: hookUrl, signingSecret: created.signingSecret });
-    console.log(`webhook 已指向 ${hookUrl}（项目 ${projectId}）`);
+    this.kv.put("hookReset", HOOK_RESET);
+    try {
+      const { logInfo } = await import("../core/server/src/logs.js");
+      logInfo("桥接", `已在 Photon 重新登记 webhook：${hookUrl}（id ${created.id}）`);
+    } catch {
+      /* 日志失败不影响 */
+    }
     return created.signingSecret;
   }
 }
