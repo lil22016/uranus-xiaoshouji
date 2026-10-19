@@ -75,6 +75,13 @@ export async function watchChatBackground({ projectId, projectSecret, label, onC
 
   let stopped = false;
   let attempt = 0;
+  /*
+   * 连上之后稳住一阵才把失败次数清零。以前一连上就清，Photon 那边接了连接、
+   * 下一秒又拒掉（"admission queue limit reached"）时，每次都是「第 1 次、
+   * 30 秒后重连」，退避永远长不起来，每 30 秒敲一次门。
+   */
+  let healthyTimer = null;
+  const HEALTHY_AFTER_MS = 2 * 60_000;
   let timer = null;
   /** 当前活着的客户端/流，stopRunner 时要一起收掉 */
   let clients = [];
@@ -83,6 +90,10 @@ export async function watchChatBackground({ projectId, projectSecret, label, onC
 
   const stop = async () => {
     stopped = true;
+    if (healthyTimer) {
+      clearTimeout(healthyTimer);
+      healthyTimer = null;
+    }
     if (timer) {
       clearTimeout(timer);
       timer = null;
@@ -109,6 +120,10 @@ export async function watchChatBackground({ projectId, projectSecret, label, onC
 
   const scheduleRetry = (why) => {
     if (stopped) return;
+    if (healthyTimer) {
+      clearTimeout(healthyTimer);
+      healthyTimer = null;
+    }
     attempt += 1;
     const wait = Math.min(RETRY_BASE_MS * 2 ** (attempt - 1), RETRY_MAX_MS);
     logWarn(scope, `${why}，${Math.round(wait / 1000)} 秒后重连（第 ${attempt} 次）`);
@@ -148,7 +163,12 @@ export async function watchChatBackground({ projectId, projectSecret, label, onC
     // 连上就先清掉退避计数，下次真断了重新从 30 秒起步。
     // 注意这个 Promise 只在**建连那一步**结束，不等流断 —— 断开由每条流
     // 自己的 scheduleRetry 处理，不是靠这里 reject。
-    attempt = 0;
+    if (healthyTimer) clearTimeout(healthyTimer);
+    healthyTimer = setTimeout(() => {
+      healthyTimer = null;
+      attempt = 0;
+    }, HEALTHY_AFTER_MS);
+    healthyTimer.unref?.();
   }
 
   /* 流本身在后台跑；这个函数只负责把事件喂给 onChanged */
