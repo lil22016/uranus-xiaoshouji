@@ -187,6 +187,7 @@ export class Uranus extends DurableObject {
       } catch (e) {
         r = { status: 500, text: String(e?.message ?? e) };
       }
+      void this.hookSeen(body, headers, r).catch(() => {});
       if (r.status >= 400) void this.hookFailed(r).catch(() => {});
       return new Response(r.text, { status: r.status });
     }
@@ -254,6 +255,32 @@ export class Uranus extends DurableObject {
   }
 
   /**
+   * 每一次 Photon 推送都在控制台留一行：推来了什么、交出去了几条。
+   *
+   * 这一行是「消息到底有没有到这个 Worker」的唯一证据。以前推送到了 /hook、
+   * SDK 回了 200 却一条消息都没解出来时，控制台一个字都没有，跟「根本没推过来」
+   * 分不出来。
+   */
+  async hookSeen(body, headers, r) {
+    const { logInfo, logWarn } = await import("../core/server/src/logs.js");
+    let event = headers["x-spectrum-event"] || "?";
+    let ctype = "?";
+    try {
+      const j = JSON.parse(new TextDecoder().decode(body));
+      event = j?.event ?? event;
+      ctype = j?.message?.content?.type ?? (Array.isArray(j?.messages) ? `批量 ${j.messages.length} 条` : "?");
+    } catch {
+      /* 不是 JSON 就算了 */
+    }
+    const line = `收到 Photon 推送（event=${event}，内容=${ctype}，${body.length} 字节）→ ${r.status}，交给 Uranus ${r.delivered ?? 0} 条`;
+    if (r.status < 400 && !r.delivered) {
+      logWarn("桥接", `${line}。SDK 回了成功却没解出任何消息，这条被丢了（推送格式可能变了）`);
+    } else {
+      logInfo("桥接", line);
+    }
+  }
+
+  /**
    * Photon 推来了一条消息，但没能交给 Uranus。
    *
    * 以前这几种情况只回 Photon 一个状态码，Uranus 的控制台里一个字都没有 ——
@@ -308,11 +335,24 @@ export class Uranus extends DurableObject {
 
     const listed = (await api("/webhooks/")) ?? [];
     const hooks = Array.isArray(listed) ? listed : (listed.webhooks ?? []);
+    // 在控制台说清楚 Photon 上登记了哪些地址 —— 收不到消息时第一件要核对的事
+    try {
+      const { logInfo } = await import("../core/server/src/logs.js");
+      const urls = hooks.map((h) => `${h.webhookUrl}${h.webhookUrl === hookUrl ? "（就是这里）" : ""}`);
+      logInfo("桥接", `Photon 上登记的 webhook：${urls.join("、") || "一个都没有"}；本后端的收消息地址是 ${hookUrl}`);
+    } catch {
+      /* 日志失败不影响登记 */
+    }
     if (saved?.url === hookUrl && saved.signingSecret && hooks.some((h) => h.id === saved.id)) {
       return saved.signingSecret;
     }
     for (const h of hooks.filter((h) => h.webhookUrl === hookUrl)) {
-      await api(`/webhooks/${h.id}`, { method: "DELETE" });
+      // 文档写的是 DELETE /webhooks/{id}/（带斜杠），老写法不带；两种都试
+      try {
+        await api(`/webhooks/${h.id}/`, { method: "DELETE" });
+      } catch {
+        await api(`/webhooks/${h.id}`, { method: "DELETE" });
+      }
     }
     const created = await api("/webhooks/", { method: "POST", body: JSON.stringify({ webhookUrl: hookUrl }) });
     if (!created?.signingSecret) throw new Error("Photon 建 webhook 没回签名密钥");

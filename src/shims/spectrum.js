@@ -162,16 +162,19 @@ export async function waitLive(ms) {
  * @returns {Promise<{status:number, text:string}>}
  */
 export async function deliverWebhook(body, headers) {
-  if (!live.size) return { status: 503, text: "没有在线的线路" };
-  let last = { status: 401, text: "signature" };
+  if (!live.size) return { status: 503, text: "没有在线的线路", delivered: 0 };
+  let last = { status: 401, text: "signature", delivered: 0 };
   for (const { real, queue } of live.values()) {
+    // 数一下 SDK 实际交出了几条：验签过了、回了 200，却一条都没解出来的情况以前完全看不见
+    let delivered = 0;
     const res = await real.webhook({ body, headers }, (space, message) => {
+      delivered++;
       patchContent(space, message);
       queue.push([space, message]);
     });
     const text = new TextDecoder().decode(res.body ?? new Uint8Array());
-    if (res.status !== 401) return { status: res.status, text };
-    last = { status: res.status, text };
+    if (res.status !== 401) return { status: res.status, text, delivered };
+    last = { status: res.status, text, delivered };
   }
   return last;
 }
