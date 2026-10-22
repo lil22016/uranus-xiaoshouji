@@ -701,6 +701,43 @@ function parseMeta(html) {
   return { siteName, title, desc };
 }
 
+/**
+ * 「一起听」里分享出来的歌词卡（Companion Worker 的 `/s/<id>` 页面）。
+ *
+ * 那个页面的 og 标签是给 iMessage 画卡片用的；简介在这边会被 MAX_DESC 截到
+ * 120 字，歌词一多就断了。所以页面 <head> 里另外嵌了一段
+ * `<script type="application/json" id="uranus-song-share">`，这里认出它就
+ * 直接拼一句完整的说明，并且把「这是对方分享给你的一首歌」说死 ——
+ * 不然模型只看到一串链接和半截歌词，不一定反应得过来这是在分享歌。
+ *
+ * 不认识这段 JSON 的页面一律返回 null，走原来的 og 那条路。
+ */
+const SONG_SHARE_RE = /<script[^>]*id=["']uranus-song-share["'][^>]*>([\s\S]{0,20000}?)<\/script>/i;
+function parseSongShare(html) {
+  const m = SONG_SHARE_RE.exec(String(html ?? ""));
+  if (!m) return null;
+  let data;
+  try {
+    data = JSON.parse(m[1]);
+  } catch {
+    return null;
+  }
+  if (data?.kind !== "song_share" || !data?.song?.name) return null;
+  const name = clean(data.song.name, 80);
+  const artist = clean(data.song.artist ?? "", 60);
+  const album = clean(data.song.album ?? "", 40);
+  const lines = (Array.isArray(data.lines) ? data.lines : [])
+    .map((x) => clean(String(x ?? ""), 200))
+    .filter(Boolean)
+    .slice(0, 12);
+  const title = `《${name}》${artist ? ` — ${artist}` : ""}${album ? `（专辑《${album}》）` : ""}`;
+  const note =
+    `[这条链接是对方从「一起听」里分享给你的一首歌：${title}。` +
+    (lines.length ? `对方特意挑了这几句歌词给你看：\n${lines.map((l) => `「${l}」`).join("\n")}\n` : "") +
+    "链接打开是一张歌词卡片，内容就是上面这些，不用再去搜这首歌。]";
+  return { siteName: "", title, desc: "", note };
+}
+
 /* ================= 第 3 层：少数站的专门处理 ================= */
 
 /**
@@ -1191,7 +1228,9 @@ async function resolveOne(raw, scope) {
   if (!info) {
     try {
       const html = await fetchHead(final, scope);
-      const og = parseMeta(html);
+      // 自己的歌词分享页（Companion 的 /s/<id>）：认那段内嵌 JSON，给出完整歌词，见 parseSongShare
+      const shared = parseSongShare(html);
+      const og = shared ?? parseMeta(html);
       /*
        * 专门处理失败后退回 og 时，**og 的结果要再挑一次**。
        *
@@ -1293,6 +1332,11 @@ export async function renderLinks(text, scope = "链接") {
     const r = settled[i];
     if (r.status !== "fulfilled" || !r.value) continue;
     const { siteName, title, desc, videoSkip } = r.value;
+    // 自己的歌词分享页带着现成的整句说明（见 parseSongShare），原样用
+    if (r.value.note) {
+      notes.set(targets[i], r.value.note);
+      continue;
+    }
     // 标题里已经带着站名时别再前置一遍（GitHub 的 og:title 就是
     // 「GitHub - nodejs/node: …」，加上去会变成「GitHub - GitHub - …」）
     const dup = siteName && title.toLowerCase().includes(siteName.toLowerCase());
