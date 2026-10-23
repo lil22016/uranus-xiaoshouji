@@ -100,7 +100,9 @@ import {
   COOLDOWN_MS,
   FALLBACK_HOURS,
   buildProactiveInput,
+  casualReplyDelayMs,
   humanizeWait,
+  judgeBusyByLLM,
   judgeWaitByLLM,
   judgeWaitMs,
   msUntilFocusEnd,
@@ -1352,6 +1354,41 @@ export function enqueue(getConfig, runner, space, spaceId, item, peer = "") {
       return;
     }
     slot.due = false;
+    // 晚回时刻还没到（合并关着时新消息会直接调 fire）：挂回去，到点再来
+    if (!force && slot.delayUntil && Date.now() < slot.delayUntil - 500) {
+      runner.pending.set(spaceId, slot);
+      slot.firesAt = slot.delayUntil;
+      slot.timer = setTimeout(fire, slot.delayUntil - Date.now());
+      return;
+    }
+    /*
+     * 晚一点回（chat.replyDelay）：合并窗口到点之后，先不急着去想怎么回。
+     *
+     * 第一次到点 → 去算这一轮要晚多久（可能要问一次判断模型），算好了重新挂一个计时器，
+     * 到点再进来时 `delayDone` 已经是 true，直接往下走。slot 一直留在 runner.pending 里，
+     * 所以晚回期间对方再发的消息会进**同一轮**（见下面 enqueue 里 delayUntil 那段）。
+     *
+     * 已读回执是在 handleTurn 开头才发的，所以这段时间对方那边一直是「已送达」，
+     * 像是角色真的还没看手机。flushPending（指令 / 协助 / 线下）传 force，跳过这一步。
+     */
+    if (!force && !slot.delayDone && getConfig().chat?.replyDelay?.enabled) {
+      runner.pending.set(spaceId, slot);
+      if (!slot.delayPlanning) {
+        slot.delayPlanning = true;
+        void planReplyDelay(getConfig, runner, slot, spaceId).then((ms) => {
+          slot.delayPlanning = false;
+          slot.delayDone = true;
+          if (runner.stopped || runner.pending.get(spaceId) !== slot) return;
+          slot.delayUntil = Date.now() + ms;
+          // 算的这几秒里对方又发了消息、计时器已经重开了：取两者里更晚的那个
+          const at = Math.max(slot.timer ? slot.firesAt ?? 0 : 0, slot.delayUntil);
+          if (slot.timer) clearTimeout(slot.timer);
+          slot.firesAt = at;
+          slot.timer = setTimeout(fire, Math.max(0, at - Date.now()));
+        });
+      }
+      return;
+    }
     runner.pending.delete(spaceId);
     const videos = slot.videos ?? [];
     if (runner.stopped) {
@@ -1406,10 +1443,12 @@ export function enqueue(getConfig, runner, space, spaceId, item, peer = "") {
    * 窗口已经开着：从这一条起重新倒计时 queueWait 秒。判据用 `slot.timer` 而不是「texts 是不是空的」：只发了
    * 一张图、一条语音那轮一个字都没有，但窗口一样已经开着了。
    */
+  // 晚回期间又来一条：照常重新倒计时，但不会早于原本定好的晚回时刻
+  const holdMs = () => Math.max(wait * 1000, (slot.delayUntil ?? 0) - Date.now());
   if (slot.timer) {
     clearTimeout(slot.timer);
-    slot.firesAt = Date.now() + wait * 1000;
-    slot.timer = setTimeout(fire, wait * 1000);
+    slot.firesAt = Date.now() + holdMs();
+    slot.timer = setTimeout(fire, holdMs());
     logDebug(scopeOf(runner, "桥接"), `又攒一条：${counts}，重新倒计时，${wait}s 内没有新消息就发`);
     return;
   }
@@ -1426,9 +1465,53 @@ export function enqueue(getConfig, runner, space, spaceId, item, peer = "") {
     return;
   }
 
+  // 正在算要晚多久（delayPlanning）时也会走到这儿：先按合并窗口挂一个，算好之后那边会取更晚的那个
   logDebug(scopeOf(runner, "桥接"), `攒消息中：${counts}，${wait}s 后把这期间的一起发`);
-  slot.firesAt = Date.now() + wait * 1000;
-  slot.timer = setTimeout(fire, wait * 1000);
+  slot.firesAt = Date.now() + holdMs();
+  slot.timer = setTimeout(fire, holdMs());
+}
+
+/**
+ * 这一轮要晚多久才回（毫秒）。只在 chat.replyDelay.enabled 时被调用。
+ *
+ * 平时：minMinutes~maxMinutes 之间随机。开了 judgeBusy 时先问一次判断模型
+ * （见 proactive.js:judgeBusyByLLM），角色在忙就按它给的分钟数晚回。
+ * 任何一步出错都退回平时那个随机数，绝不让回复卡住。
+ */
+async function planReplyDelay(getConfig, runner, slot, spaceId) {
+  const scope = scopeOf(runner, "晚点回");
+  const config = getConfig();
+  const rd = config.chat?.replyDelay ?? {};
+  const casual = casualReplyDelayMs(rd);
+  let ms = casual;
+  let why = "平时";
+  const role = currentRole(config, runner);
+  if (rd.judgeBusy && role) {
+    try {
+      const user = resolveUser(config, role);
+      const sessionId = sessionIdOf(runner, role, slot.peer || spaceId);
+      loadHistory(runner, role, sessionId, scope);
+      const maxBusy = Math.max(5, Number(rd.maxBusyMinutes) || 30);
+      const v = await judgeBusyByLLM(
+        config,
+        role,
+        user,
+        runner.history.get(sessionId) ?? [],
+        slot.texts.join("\n"),
+        maxBusy,
+        scope
+      );
+      if (v.busy) {
+        const mins = Math.min(maxBusy, Math.max(Number(rd.maxMinutes) || 3, v.minutes || 0));
+        ms = Math.round(mins * 60_000);
+        why = `在忙${v.reason ? `（${v.reason}）` : ""}`;
+      }
+    } catch (e) {
+      logWarn(scope, "判断角色忙不忙失败，按平时的随机延迟", e);
+    }
+  }
+  logInfo(scope, `${role?.name ?? "角色"}${why}，${ms >= 60_000 ? humanizeWait(ms) : `${Math.round(ms / 1000)} 秒`}后再看消息`);
+  return ms;
 }
 
 /**

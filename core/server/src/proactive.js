@@ -2,6 +2,7 @@ import { applyVars, resolveEndpoint } from "./config.js";
 import { chatCompletion } from "./llm.js";
 import { logDebug, logInfo, logWarn } from "./logs.js";
 import { wrap } from "./prompt.js";
+import { renderCompanionContext } from "./companioncontext.js";
 
 /**
  * 主动消息的**算时间**那一半。
@@ -292,6 +293,108 @@ export async function judgeWaitByLLM(config, role, user, history, scope, opts = 
   }
 
   return parseHours(content, scope);
+}
+
+/* ------------------------------------------------------------------ *
+ * 晚一点回（chat.replyDelay）。
+ *
+ * 平时：收到消息后随机晚 minMinutes~maxMinutes 分钟才开始想怎么回。
+ * 开了「让模型判断角色在不在忙」时，先问一次**判断主动消息时间的那个模型**
+ * （proactive.auto.model，没选就是主聊天模型）：按人设、作息、现在几点、
+ * Companion 里的日程和最近的聊天，{{char}} 这会儿是不是正忙着看不了手机。
+ * 忙的话按它给的分钟数晚回（上限 maxBusyMinutes）；不忙就用平时那个随机数。
+ *
+ * 判断失败一律退回平时的随机数 —— 这只是个调味的功能，不能让它卡住回复。
+ * ------------------------------------------------------------------ */
+
+/** 平时那段随机延迟（毫秒）。 */
+export function casualReplyDelayMs(rd) {
+  const lo = Math.max(0, Number(rd?.minMinutes) || 0);
+  const hi = Math.max(lo, Number(rd?.maxMinutes) || 0);
+  return Math.round((lo + Math.random() * (hi - lo)) * 60_000);
+}
+
+/** 从判断模型的回答里抠 {busy, minutes, reason}。抠不出就当不忙。 */
+export function parseBusy(text) {
+  const raw = String(text ?? "")
+    .replace(/<think>[\s\S]*?<\/think>/gi, " ")
+    .replace(/```(?:json)?/gi, " ")
+    .trim();
+  const a = raw.indexOf("{");
+  const b = raw.lastIndexOf("}");
+  if (a >= 0 && b > a) {
+    try {
+      const o = JSON.parse(raw.slice(a, b + 1));
+      const minutes = Number(o.minutes);
+      return {
+        busy: o.busy === true || o.busy === "true",
+        minutes: Number.isFinite(minutes) ? minutes : 0,
+        reason: String(o.reason ?? "").trim().slice(0, 120),
+      };
+    } catch {
+      /* 落到下面 */
+    }
+  }
+  return { busy: false, minutes: 0, reason: "" };
+}
+
+/**
+ * 问模型：{{char}} 现在忙不忙、忙的话多久之后才看得到消息。
+ *
+ * @param {string} incoming 这一轮对方发来的（合并后的）文字
+ * @returns {Promise<{busy:boolean, minutes:number, reason:string}>} 请求失败会 throw
+ */
+export async function judgeBusyByLLM(config, role, user, history, incoming, maxBusyMinutes, scope) {
+  const p = role?.proactive ?? {};
+  const ref = p.auto?.model;
+  const picked = ref?.provider && ref?.modelId ? resolveEndpoint(config, ref) : null;
+  const endpoint = picked ?? resolveEndpoint(config, role?.chatModel);
+  if (!endpoint) throw new Error("这个角色的聊天模型没配好，判断不了忙不忙");
+
+  const vars = { char: role?.name ?? "", user: user?.name ?? "" };
+  const companion = renderCompanionContext(role?.id);
+  const facts = [
+    wrap("Now", nowLine()),
+    wrap("Character", applyVars(role?.description ?? "", vars)),
+    companion ? wrap("Companion", companion) : "",
+    wrap("Chat_History", historyLines((history ?? []).slice(-10), vars)),
+    wrap("Incoming", String(incoming ?? "").trim() || "（对方发了图片 / 语音之类，没有文字）"),
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+
+  const ask = applyVars(
+    `你是{{char}}。{{user}}刚刚给你发了消息（见 <Incoming>）。判断此刻的{{char}}是不是正在忙、一时看不了手机或腾不出手回消息` +
+      `（比如在上课、开会、工作、开车、洗澡、运动、睡觉、在做一件需要专心的事）。\n` +
+      `判断依据：{{char}}的人设和作息、现在几点、Companion 里{{char}}今天的日程（如果有）、最近聊天里提到的安排。\n` +
+      `如果不忙，或者只是平常在做点小事，busy 写 false。\n` +
+      `如果忙，minutes 写大概多少分钟之后才能看到并回复（5 到 ${maxBusyMinutes} 之间的整数），reason 用一句话说在忙什么。\n` +
+      `如果{{user}}的消息明显很急（出事了、很难过、在等你回答一件要紧的事），哪怕在忙也会尽快抽空看，minutes 写小一点。\n` +
+      `只回一行 JSON：{"busy":true或false,"minutes":数字,"reason":"一句话"}，不要写别的。`,
+    vars
+  );
+  const messages = [
+    { role: "system", content: ask },
+    { role: "system", content: facts },
+    { role: "user", content: `${ask}\n\n现在只回那一行 JSON。` },
+  ];
+  const once = (maxTokens) =>
+    chatCompletion(endpoint, messages, {
+      label: endpoint.label || "忙不忙判断",
+      timeout: JUDGE_TIMEOUT,
+      maxTokens,
+      params: { temperature: 0.3 },
+    });
+  let content = "";
+  try {
+    content = await once(JUDGE_MAX_TOKENS);
+  } catch (e) {
+    if (e?.aborted) throw e;
+    logWarn(scope, "忙不忙判断没打通，不限 token 再问一次", e);
+    content = await once(0);
+  }
+  if (!String(content ?? "").trim()) content = await once(0);
+  return parseBusy(content);
 }
 
 /* 带单位的时长。数字在 $1，第二项是换算成小时的系数。 */

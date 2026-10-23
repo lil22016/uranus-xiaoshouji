@@ -425,6 +425,12 @@ export const DEFAULT_CONFIG = {
     // 强制分隔：不认 $，改按逗号句号换行空格切。和 separator 是互斥的两条路
     forceSeparator: false,
     queueWait: 8, // 收到消息后合并等待时间（秒）
+    /*
+     * 晚一点回：合并窗口到点后，再随机晚 minMinutes~maxMinutes 分钟才开始回。
+     * judgeBusy 开着时先问判断主动消息时间的那个模型「角色这会儿忙不忙」，
+     * 忙就按它给的分钟数晚回（不超过 maxBusyMinutes）。默认关。
+     */
+    replyDelay: { enabled: false, minMinutes: 1, maxMinutes: 3, judgeBusy: false, maxBusyMinutes: 30 },
     delay: {
       typingSpeed: 0.2, // 打字速度
       randomMin: 0.05, // 随机下限
@@ -1521,6 +1527,24 @@ function normalizeClock(input, fallback) {
  * 角色会被 backup.js:buildBundle 原样打进可分享的备份包。
  * 空引用 = 用这个角色的主聊天模型（用户规范里的「不选择的话默认使用主 API」）。
  */
+/** chat.replyDelay：两头反着填就对调；分钟数都钳在合理范围里。 */
+function normalizeReplyDelay(input, base) {
+  const d = base ?? { enabled: false, minMinutes: 1, maxMinutes: 3, judgeBusy: false, maxBusyMinutes: 30 };
+  const num = (v, dflt, lo, hi) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : dflt;
+  };
+  const a = num(input?.minMinutes, d.minMinutes, 0, 60);
+  const b = num(input?.maxMinutes, d.maxMinutes, 0, 60);
+  return {
+    enabled: [true, "true", 1, "1"].includes(input?.enabled),
+    minMinutes: Math.min(a, b),
+    maxMinutes: Math.max(a, b),
+    judgeBusy: [true, "true", 1, "1"].includes(input?.judgeBusy),
+    maxBusyMinutes: num(input?.maxBusyMinutes, d.maxBusyMinutes, 5, 240),
+  };
+}
+
 function normalizeProactive(input) {
   // 提示词留空 = 恢复默认，和 normalizeMemories 里那套一个写法
   const prompt = (v, fallback) => (str(v).trim() ? str(v) : fallback);
@@ -3195,6 +3219,7 @@ export function normalizeConfig(input) {
           ? input.chat.queueWait
           : base.chat.queueWait,
       delay: { ...base.chat.delay, ...(input.chat.delay ?? {}) },
+      replyDelay: normalizeReplyDelay(input.chat.replyDelay, base.chat.replyDelay),
     };
   }
 
