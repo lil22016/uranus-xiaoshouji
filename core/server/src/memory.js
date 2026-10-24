@@ -682,16 +682,17 @@ export async function summarizeMemo(config, role, key, now = new Date()) {
   const endpoint = chainEndpoint(config, cfg.model, "生成备忘录");
   const messages = buildMemoMessages(config, role, key, pending.text, now);
 
+  const label = endpoint.label ? `备忘录（${endpoint.label}）` : "备忘录";
   const raw = await chatCompletion(endpoint, messages, {
-    label: endpoint.label ? `备忘录（${endpoint.label}）` : "备忘录",
+    label,
     params: SUMMARY_PARAMS,
     timeout: SUMMARY_TIMEOUT,
     // 备忘录是**整份覆盖**的，一句道歉能把用户攒了几个月的清单冲干净。
     // 这条是四条链里最不能容忍「把拒答当成结果」的一条
     retryOnRefusal: SUMMARY_REFUSAL_RETRIES,
   });
-  const text = raw.trim();
-  if (!text) throw new Error("模型返回了空的备忘录");
+  const first = raw.trim();
+  if (!first) throw new Error("模型返回了空的备忘录");
 
   /*
    * 缩水闸：新的一份**明显比旧的短**就不写，当这一轮失败。
@@ -714,28 +715,60 @@ export async function summarizeMemo(config, role, key, now = new Date()) {
   const LEAN_FLOOR = 6;
   const LEAN_RATIO = 0.6;
   const old = readMemo(key);
-  const before = memoEntries(old).length;
-  // 闸只拿「本来就该留下的」条目来比：上一版已经标了「已完成 / 已过时 /
-  // 下次更新会删除」的条目，提示词明确叫模型这一轮删掉；它们照算的话，
-  // 旧清单里攒了一堆待删项时，模型每次**按规矩**删，闸就每次判它「漏了」，
-  // 备忘录永远更新不了、待删项也永远删不掉（2026-10 用户撞上的就是这个死循环）
-  const keep = memoEntries(old).filter((l) => !MEMO_DONE.test(l)).length;
-  const after = memoEntries(text).length;
-  if (keep >= LEAN_FLOOR && after < Math.ceil(keep * LEAN_RATIO)) {
-    // 这一版不写盘，所以正文只剩日志这一个去处 —— 用户要能核对「到底是模型漏了
-    // 还是它合并得挺好、是这道闸判严了」，不记下来就只剩一句抽象的失败提示
+  const oldItems = memoEntries(old);
+  const before = oldItems.length;
+  // 闸只拿「本来就该留下的」条目来比：标了「已完成 / 待删除」的，和里面写的
+  // 日期全都早就过了的（过期的日程，提示词本来就允许删），都不算「该留的」
+  const keepItems = oldItems.filter((l) => !MEMO_DONE.test(l) && !memoExpired(l, now));
+  const keep = keepItems.length;
+  const short = (t) => keep >= LEAN_FLOOR && memoEntries(t).length < Math.ceil(keep * LEAN_RATIO);
+
+  let text = first;
+  if (short(text)) {
+    /*
+     * 以前这里直接 throw，等下一轮再试。可下一轮喂进去的还是同一份旧备忘录
+     * （只是待总结的对话更长了），模型照样合并 / 漏条目，于是**每一轮都失败**，
+     * 待总结的对话越攒越多（用户撞上过 450 行），备忘录永远更新不了 ——
+     * 「⚠️ 连着 3 次没总结成功」就这么反复出现。
+     *
+     * 现在分两步，都在这一轮里做完：
+     * 1. 当场让模型改一次：告诉它漏了多少条，要它补全。
+     * 2. 还是不够，就**程序合并**：取模型这一版，把旧备忘录里在新版找不到
+     *    对应内容的条目原样补回末尾。这样新信息照常写进去、待总结的对话照常清掉，
+     *    旧条目一条也不会因为模型偷懒而消失（要删得靠模型按规矩标「下次更新会删除」）。
+     */
     logWarn(
       "记忆库",
-      `${key} 的备忘录这一版从 ${before} 条（其中该留的 ${keep} 条）缩到 ${after} 条，没有覆盖。模型这次写的全文如下`,
+      `${key} 的备忘录这一版从 ${before} 条（该留的 ${keep} 条）缩到 ${memoEntries(text).length} 条，让模型补一次。它这次写的全文如下`,
       text
     );
-    throw new Error(
-      `模型这一版备忘录只剩 ${after} 条，原来有 ${before} 条` +
-        (keep < before ? `（去掉标了已完成 / 待删除的，该留的有 ${keep} 条）` : "") +
-        ` —— 像是把旧条目漏掉了，` +
-        `所以没有覆盖。待总结的对话还留着，下一轮会再试一次（这一版的全文在控制台日志里）`
-    );
+    try {
+      const fix = await chatCompletion(
+        endpoint,
+        [
+          ...messages,
+          { role: "assistant", content: text },
+          { role: "user", content: memoShrinkNudge(before, keep, memoEntries(text).length) },
+        ],
+        { label: `${label}·补全`, params: SUMMARY_PARAMS, timeout: SUMMARY_TIMEOUT, retryOnRefusal: SUMMARY_REFUSAL_RETRIES }
+      );
+      const t2 = String(fix ?? "").trim();
+      if (t2 && memoEntries(t2).length > memoEntries(text).length) text = t2;
+    } catch (e) {
+      logWarn("记忆库", `${key} 备忘录补全那一次没打通：${e.message}，直接走程序合并`);
+    }
+    if (short(text)) {
+      const { merged, restored } = restoreMemoItems(text, keepItems, now);
+      logWarn(
+        "记忆库",
+        `${key} 模型补完还是只有 ${memoEntries(text).length} 条，` +
+          `程序把旧版里新版没写到的 ${restored.length} 条补回去了（旧版已备份）`,
+        restored.join("\n")
+      );
+      text = merged;
+    }
   }
+  const after = memoEntries(text).length;
 
   writeMemo(key, text);
   commitPending("memo", key);
@@ -755,6 +788,79 @@ function memoEntries(s) {
   const lines = String(s ?? "").split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !MEMO_STAMP.test(l));
   const numbered = lines.filter((l) => /^\d+\s*[.、．)]/.test(l));
   return numbered.length ? numbered : lines;
+}
+
+/** 模型这一版缩水时，当场追问的那一句。 */
+function memoShrinkNudge(before, keep, after) {
+  return (
+    `你这一版只有 ${after} 条，但现有备忘录里有 ${before} 条，其中没标「已完成 / 待删除」、也没过期的有 ${keep} 条。` +
+    `按规则，这些未完成、未过期的条目必须完整保留，不能合并成笼统的一句，也不能省略。` +
+    `只有标了「（下次更新备忘录会删除该项）」的、或日期已经过去的日程可以删掉；完全重复的两条可以合成一条。` +
+    `请重新输出一份完整的备忘录：保留所有该留的旧条目，再加上这次对话里的新信息，` +
+    `格式不变（「编号. 内容」，最后一行是更新时间），只输出备忘录本身。`
+  );
+}
+
+/** 条目里写的日期（MM月DD日）全都在 3 天以前 → 过期的日程。没写日期的不算过期。 */
+function memoExpired(line, now = new Date()) {
+  const ds = [...String(line).matchAll(/(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]/g)];
+  if (!ds.length || /生日|纪念日|每年|每月|每周|每天/.test(line)) return false;
+  const cutoff = now.getTime() - 3 * 86400000;
+  return ds.every(([, m, d]) => {
+    const t = new Date(now.getFullYear(), Number(m) - 1, Number(d));
+    // 比现在晚半年以上的，多半是去年写的（跨年时 12 月的条目在 1 月看）
+    if (t.getTime() - now.getTime() > 180 * 86400000) t.setFullYear(t.getFullYear() - 1);
+    return t.getTime() < cutoff;
+  });
+}
+
+/** 去掉编号、标点、空白，只留字，拿来比相似度。 */
+function memoCore(line) {
+  return String(line)
+    .replace(/^\s*\d+\s*[.、．)]\s*/, "")
+    .replace(/[\s\p{P}\p{S}]/gu, "")
+    .toLowerCase();
+}
+function bigrams(s) {
+  const out = new Set();
+  for (let i = 0; i < s.length - 1; i++) out.add(s.slice(i, i + 2));
+  if (s.length === 1) out.add(s);
+  return out;
+}
+/** 旧条目的字有多少落在新版某一条里（取最高的那条）。合并成长句的也算得上。 */
+function memoCoverage(oldLine, newCores) {
+  const a = bigrams(memoCore(oldLine));
+  if (!a.size) return 1;
+  let best = 0;
+  for (const nb of newCores) {
+    let hit = 0;
+    for (const g of a) if (nb.has(g)) hit++;
+    best = Math.max(best, hit / a.size);
+  }
+  return best;
+}
+
+/**
+ * 程序合并：新版里找不到对应内容的旧条目（覆盖率 < 40%）原样补到末尾，
+ * 接着新版的编号往下排，「更新时间」那行留在最后。
+ */
+function restoreMemoItems(text, keepItems, now = new Date()) {
+  const lines = String(text).split(/\r?\n/);
+  const stampLines = lines.filter((l) => MEMO_STAMP.test(l.trim()));
+  const body = lines.filter((l) => !MEMO_STAMP.test(l.trim()));
+  while (body.length && !body[body.length - 1].trim()) body.pop();
+  const newItems = memoEntries(text);
+  const newCores = newItems.map((l) => bigrams(memoCore(l)));
+  // 整份新版也算一条：模型把好几条揉进一段里时，按条比会漏判
+  newCores.push(bigrams(memoCore(newItems.join(""))));
+  const restored = keepItems.filter((l) => !memoExpired(l, now) && memoCoverage(l, newCores) < 0.4);
+  let n = newItems.reduce((mx, l) => Math.max(mx, Number(/^(\d+)/.exec(l)?.[1] ?? 0)), 0) || newItems.length;
+  for (const l of restored) {
+    n += 1;
+    body.push(`${n}. ${l.replace(/^\s*\d+\s*[.、．)]\s*/, "")}`);
+  }
+  const stamp = stampLines.length ? stampLines[stampLines.length - 1].trim() : "";
+  return { merged: [...body, ...(stamp ? [stamp] : [])].join("\n"), restored };
 }
 
 /* ---------------- 日记 ---------------- */
@@ -800,16 +906,64 @@ function fillDiaryPrompt(cfg, fill) {
  * 才压得住。写中文（或没写这一行）时什么都不加，行为和以前完全一样。
  */
 export function diaryLanguageNote(promptText) {
-  const m = /^[ \t-]*(?:output_)?language\s*:\s*["']?([^"'\r\n]+?)["']?\s*$/im.exec(
-    String(promptText ?? "")
-  );
-  const lang = m?.[1]?.trim();
-  if (!lang || /中文|汉语|漢語|chinese|zh/i.test(lang)) return "";
+  const lang = diaryLanguage(promptText);
+  if (!lang) return "";
   return (
     `【最终要求·输出语言】这篇日记的全文（包括结尾的 To-do list 和它的标题）必须使用「${lang}」书写。` +
     `即使上面的聊天记录、人设、记忆、旧日记是别的语言，也一律用「${lang}」，不要夹杂其他语言。\n` +
     `FINAL REQUIREMENT: write the ENTIRE diary, including the To-do list and its heading, in ${lang}. ` +
     `Do not switch to any other language even if the chat log, memories or previous diaries are in another language.`
+  );
+}
+
+const CHINESE = /中文|汉语|漢語|普通话|chinese|^zh/i;
+
+/**
+ * 提示词里写的输出语言（不是中文才返回，中文 / 没写返回空串）。
+ *
+ * 扫**每一行**而不是只看第一行：默认模板顶上有一行 `language: "中文"`，
+ * 用户在别处（文风、待办、自己加的一行）再写 `language: English` 时，
+ * 只看第一行就会一直认成中文，末尾那句「必须用 English」从来没加上过。
+ * 行尾带补充说明（`language: "English"，To-do 也用英文`）也认得出来。
+ */
+export function diaryLanguage(promptText) {
+  const re = /^[ \t-]*(?:output_language|language|输出语言|语言)\s*[:：]\s*["'「“]?([^"'」”\r\n,，;；#（(]+)/gim;
+  for (const m of String(promptText ?? "").matchAll(re)) {
+    const lang = m[1].trim();
+    if (lang && !CHINESE.test(lang)) return lang;
+  }
+  return "";
+}
+
+/** 这门语言按「词」数（英文这类）还是按「字」数（中日韩）。 */
+function countsWords(lang) {
+  return Boolean(lang) && !/日本|日语|japanese|韩|韓|korean|粤|cantonese/i.test(lang);
+}
+
+/**
+ * 日记的篇幅：只数正文，不数 '------' 下面的 To-do list。
+ * 英文这类按词数（"word"），中文照旧按字数。
+ */
+export function diaryLength(text, lang) {
+  const body = String(text ?? "").split(/^\s*-{3,}\s*$/m)[0];
+  if (countsWords(lang)) return (body.match(/[A-Za-z0-9\u00C0-\u024F'’-]+|[\u4e00-\u9fff]/g) ?? []).length;
+  return body.replace(/\s/g, "").length;
+}
+
+/** 放在整条消息最后的篇幅要求。写在最后才压得住旧日记的篇幅和提示词里的 min_words。 */
+function diaryLengthNote(min, max, lang) {
+  if (!min && !max) return "";
+  const range = min && max ? `${min}–${max}` : min ? `≥ ${min}` : `≤ ${max}`;
+  const zh =
+    `【最终要求·篇幅】日记正文（不含 '------' 下面的 To-do list）${min ? `不少于 ${min} ` : ""}` +
+    `${min && max ? "、" : ""}${max ? `不超过 ${max} ` : ""}${countsWords(lang) ? "个英文单词（word）" : "字"}。` +
+    `这一条优先于上面提示词里的 min_words / length_expansion_strategy，也不要参照近几天旧日记的长度。` +
+    `${max ? "宁可短一点、只写最要紧的一两件事，也绝不能超过上限。" : ""}`;
+  if (!countsWords(lang)) return zh;
+  return (
+    `${zh}\nFINAL LENGTH REQUIREMENT: the diary body (excluding the To-do list below '------') must be ${range} words. ` +
+    `This overrides min_words / length_expansion_strategy above and the length of previous diaries.` +
+    `${max ? ` Never exceed ${max} words — keep it short and focus on one or two moments.` : ""}`
   );
 }
 
@@ -866,13 +1020,22 @@ export function buildDiaryMessages(config, role, key, opts = {}) {
   // 字数要求写成单独一段，而不是塞进提示词正文 —— 用户可能改过整段提示词，
   // 往里面 replace 会碰坏他写的东西
   const limit = cfg.limit ?? {};
-  const words = limit.enabled
-    ? `这篇日记的字数要求：不少于 ${limit.min} 字，不超过 ${limit.max} 字。`
-    : "";
+  let prompt = fillDiaryPrompt(cfg, b.fill);
+  const lang = diaryLanguage(prompt);
+  if (limit.enabled) {
+    // 默认模板里写死了 `min_words: 2000`，和用户在设置里填的上限（比如 250）
+    // 正面打架 —— 模型两头都想照顾，结果就是写得又长又超。只动这一行的数字，
+    // 别的原样不碰。
+    prompt = prompt.replace(
+      /^([ \t]*)min_words\s*:\s*\d+[^\r\n]*$/m,
+      (_, ind) => `${ind}min_words: ${limit.min || 0}${limit.max ? `\n${ind}max_words: ${limit.max}` : ""}`
+    );
+  }
+  const words = limit.enabled ? diaryLengthNote(limit.min, limit.max, lang) : "";
 
   return summaryMessages(
     joinBlocks([
-      wrap("日记提示词", fillDiaryPrompt(cfg, b.fill)),
+      wrap("日记提示词", prompt),
       b.char,
       b.user,
       b.world,
@@ -880,9 +1043,9 @@ export function buildDiaryMessages(config, role, key, opts = {}) {
       wrap("备忘录", readMemo(key)),
       wrap("近N天日记", past),
       wrap("当前天气", b.fill(opts.weather ?? "")),
-      wrap("字数要求", words),
       wrap(`${role?.name || "char"}_diary_log`, log),
-      diaryLanguageNote(cfg.prompt),
+      diaryLanguageNote(prompt),
+      words,
     ])
   );
 }
@@ -896,7 +1059,9 @@ export function buildDiaryMessages(config, role, key, opts = {}) {
  * 且不会删除 {{char}}_diary_log.txt」。所以这里的 throw 是有意的：
  * 抛出去就走不到下面的 commitDiaryLog，流水一个字节都不会少。
  *
- * 上限（`limit.max`）**不重试**：写多了是能用的，重打一次纯粹是再花一次钱。
+ * 上限（`limit.max`）：开了重试时，超出上限 20% 以上也会带着「你写了多少、上限多少」
+ * 重写；重试用完还是长就收最短的那篇，**不判失败**（写长了也是能用的日记）。
+ * 英文这类语言按词数算，中文按字数算，都只数 '------' 上面的正文。
  *
  * 开了字数下限但**没开重试**时，写短了也照样收下 —— 那种配置下只打一次，
  * 判失败的话这篇日记永远生不出来（每次都短、每次都throw），流水只会越攒越长。
@@ -919,14 +1084,21 @@ export async function generateDiary(config, role, key, opts = {}) {
 
   const limit = cfg.limit ?? {};
   const min = limit.enabled ? Math.max(0, limit.min ?? 0) : 0;
-  // 开了字数下限且开了重试才多打几次；否则就一次
-  const maxTries = min && limit.retry ? Math.max(1, limit.retries ?? 3) : 1;
+  const max = limit.enabled ? Math.max(0, limit.max ?? 0) : 0;
+  const lang = diaryLanguage(fillDiaryPrompt(cfg, (t) => t));
+  const unit = countsWords(lang) ? "词" : "字";
+  // 超出上限 20% 以内放过，不为几个字多花一次钱
+  const tooLong = (n) => max > 0 && n > Math.ceil(max * 1.2);
+  // 开了字数限制且开了重试才多打几次；否则就一次
+  const maxTries = (min || max) && limit.retry ? Math.max(1, limit.retries ?? 3) : 1;
 
   let text = "";
   let tries = 0;
   let last = 0;
+  let best = null; // 写长了的里面最短的一篇：重试用完还是长，就收它
+  let convo = messages;
   for (; tries < maxTries; tries += 1) {
-    const raw = await chatCompletion(endpoint, messages, {
+    const raw = await chatCompletion(endpoint, convo, {
       label,
       params: SUMMARY_PARAMS,
       timeout: SUMMARY_TIMEOUT,
@@ -934,18 +1106,42 @@ export async function generateDiary(config, role, key, opts = {}) {
     });
     text = raw.trim();
     if (!text) throw new Error("模型返回了空的日记");
-    last = text.length;
-    if (text.length >= min) break;
-    // 只打一次的那种配置：短就短了，收下（理由见上面的文档注释）
+    last = diaryLength(text, lang);
+    const long = tooLong(last);
+    if (last >= min && !long) break;
+    if (long && (!best || last < best.n)) best = { text, n: last };
+    // 只打一次的那种配置：长短都收下（理由见上面的文档注释）
     if (maxTries === 1) break;
-    logWarn("记忆库", `日记只有 ${text.length} 字，不够 ${min} 字，第 ${tries + 1} 次重试`);
+    logWarn(
+      "记忆库",
+      `日记写了 ${last} ${unit}，${long ? `超过上限 ${max}` : `不够 ${min}`} ${unit}，第 ${tries + 1} 次重试`
+    );
+    // 带上它刚写的那篇和具体差多少，比原样再问一遍管用得多
+    convo = [
+      ...messages,
+      { role: "assistant", content: text },
+      {
+        role: "user",
+        content: long
+          ? `这篇正文有 ${last} ${unit}，超过了上限 ${max} ${unit}。请删繁就简重写，正文控制在 ${min ? `${min}–` : ""}${max} ${unit}以内，` +
+            `语言、格式和 To-do list 照旧，只输出日记本身。` +
+            (unit === "词" ? ` (The body is ${last} words; rewrite it to at most ${max} words.)` : "")
+          : `这篇正文只有 ${last} ${unit}，不够 ${min} ${unit}。请重写得充实一些，语言、格式照旧，只输出日记本身。`,
+      },
+    ];
     text = "";
   }
 
+  if (!text && best) {
+    // 重试用完还是偏长：写长了也是能用的日记，收最短的那篇，别为这个判失败
+    text = best.text;
+    last = best.n;
+    logWarn("记忆库", `日记重试了 ${maxTries} 次还是超过 ${max} ${unit}，收下最短的一篇（${last} ${unit}）`);
+  }
   if (!text) {
     // 这句会原样发给用户（imessage.js:notifyFailure），所以要说清差多少
     throw new Error(
-      `连着 ${maxTries} 次都写不够 ${min} 字（最后一次 ${last} 字），` +
+      `连着 ${maxTries} 次都写不够 ${min} ${unit}（最后一次 ${last} ${unit}），` +
         `这次不算生成成功，日记流水没有删`
     );
   }
@@ -953,8 +1149,11 @@ export async function generateDiary(config, role, key, opts = {}) {
   const file = writeDiary(key, diaryDayOf(log, now), text);
   // 写成了才清流水，而且清之前先备份。上面任何一条 throw 都走不到这里
   commitDiaryLog(key);
-  logInfo("记忆库", `${key} 生成了一篇日记 ${file}（${text.length} 字，打了 ${tries + 1} 次）`);
-  return { file, text, tries: tries + 1 };
+  logInfo(
+    "记忆库",
+    `${key} 生成了一篇日记 ${file}（正文 ${diaryLength(text, lang)} ${unit}，全文 ${text.length} 个字符，打了 ${Math.min(tries + 1, maxTries)} 次）`
+  );
+  return { file, text, tries: Math.min(tries + 1, maxTries) };
 }
 
 /**
