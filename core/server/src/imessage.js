@@ -35,6 +35,7 @@ import { logDebug, logError, logInfo, logWarn } from "./logs.js";
 import {
   DEFAULT_DIGITAL_TOUCH_PROMPT,
   DEFAULT_HANDWRITING_PROMPT,
+  applyVars,
   projectLabel,
   projectReady,
   resolveEndpoint,
@@ -4707,7 +4708,21 @@ async function runProactiveTurn(getConfig, runner, slot, spaceId, override = nul
   const composeNote = override ? "" : [igComposeNote(config, role, { user }), xhsComposeNote(config, role, { user })]
     .filter(Boolean)
     .join("\n\n");
-  const forModel = composeNote ? `${toModel}\n\n${composeNote}` : toModel;
+  /*
+   * 主动消息是「到点了、该开口了」—— 发不发早在调度那一步（随机时间 / 判断模型
+   * 给的时间 / 勿扰时段）就决定过了，到这里**必须发**。以前这一轮用的是和正常
+   * 聊天同一套提示词，里面教了 [leave_on_read]，模型把主动消息提示词当成一条
+   * 可以不回的消息，结果大部分主动消息都被它「已读不回」掉了。
+   *
+   * 两道：提示词里不注入已读不回那一条（见下面 promptRole），再在这一轮末尾
+   * 明说「必须发」；模型还是写了 [leave_on_read] 就带着提醒重打一次。
+   */
+  const mustSend = applyVars(
+    "（这是你主动找{{user}}说话的时刻，这一轮必须真的发出内容，" +
+      "不能沉默、不能输出 [leave_on_read]，也不要提到这条提示本身。）",
+    { char: role?.name ?? "", user: user?.name ?? "" }
+  );
+  const forModel = [toModel, composeNote, mustSend].filter(Boolean).join("\n\n");
   if (composeNote) logDebug(scope, `${role.name} 这一轮可以顺手发条 Instagram`);
 
   logInfo(
@@ -4727,7 +4742,11 @@ async function runProactiveTurn(getConfig, runner, slot, spaceId, override = nul
   const historyArr = runner.history.get(sessionId) ?? [];
   const forPrompt = [...historyArr, { role: "user", content: timePrefix + forModel }];
 
-  const built = await buildPrompt(config, role, user, forPrompt, weatherNote);
+  // 已读不回那一条功能说明不进主动消息的提示词（理由见上面 mustSend）
+  const promptRole = role.leaveOnRead?.enabled
+    ? { ...role, leaveOnRead: { ...role.leaveOnRead, enabled: false } }
+    : role;
+  const built = await buildPrompt(config, promptRole, user, forPrompt, weatherNote);
   const { params, preset, worldInfo } = built;
   // MCP 工具：主动开口的这一路也给（「早上自己开口前先查一下今天的日程」），
   // 和正常轮次同一套，见那边的注释
@@ -4782,6 +4801,31 @@ async function runProactiveTurn(getConfig, runner, slot, spaceId, override = nul
   }
 
   logInfo(llmScope, `模型回复 ${reply.length} 字`, reply);
+
+  // 还是写了 [leave_on_read] 而且没别的话：带着提醒重打一次
+  if (hasLeaveOnRead(reply) && !stripLeaveOnRead(reply)) {
+    logWarn(scope, "主动消息这一轮模型写了 [leave_on_read]，主动消息必须发，提醒它重写一次");
+    try {
+      const again = await chatWithFallback(
+        eps.chat,
+        eps.fallback,
+        [
+          ...messages,
+          { role: "assistant", content: reply },
+          { role: "user", content: mustSend },
+        ],
+        params,
+        mcpKit?.mode === "native" ? { tools: openAiTools(mcpKit) } : {}
+      );
+      reply = again.content;
+      toolCalls = again.toolCalls ?? [];
+      logInfo(llmScope, `重写后模型回复 ${reply.length} 字`, reply);
+    } catch (e) {
+      logError(llmScope, "主动消息重写那一次失败，这次跳过", e);
+      runner.history.set(sessionId, historyArr);
+      return;
+    }
+  }
 
   try {
     const tooled = await mcpRound(reply, toolCalls, {
@@ -4897,10 +4941,11 @@ async function runProactiveTurn(getConfig, runner, slot, spaceId, override = nul
    * 不想开口」。既然一个字都不发，历史和存档也不该留痕 —— 留了的话
    * 上下文里会攒出一串「触发了 / 没说话」，下一轮反而在教模型别开口。
    */
-  if (hasLeaveOnRead(forUser) && role.leaveOnRead?.enabled) {
-    logInfo(scope, "模型这次选择不开口（[leave_on_read]），跳过这条主动消息");
-    runner.history.set(sessionId, historyArr);
-    return;
+  if (hasLeaveOnRead(forUser)) {
+    // 主动消息不认已读不回：去掉标记，剩下的话照发；什么都不剩就走下面「没有正文」那条
+    logWarn(scope, "主动消息里还是带了 [leave_on_read]，把标记去掉、剩下的照发", forUser);
+    forUser = stripLeaveOnRead(forUser);
+    reply = stripLeaveOnRead(reply);
   }
 
   /*
