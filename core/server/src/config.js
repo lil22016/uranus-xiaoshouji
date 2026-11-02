@@ -1229,6 +1229,12 @@ function normalizeRole(input, id, legacy) {
     id,
     name: str(input?.name),
     description: str(input?.description),
+    /*
+     * 聊天专用人设。只有 iMessage 聊天（含主动消息、忙不忙的判断）读它；
+     * 空着就退回 description。查手机、小剧场、记忆整理、线下等其他功能
+     * 一律照旧读 description —— 这样聊天里写「这是短信对话」不会串到别处。
+     */
+    chatDescription: str(input?.chatDescription),
     projectRef: str(input?.projectRef),
     chatModel: { ...chat },
     hug: normalizeHug(input?.hug),

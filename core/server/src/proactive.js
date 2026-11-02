@@ -1,7 +1,7 @@
 import { applyVars, resolveEndpoint } from "./config.js";
 import { chatCompletion } from "./llm.js";
 import { logDebug, logInfo, logWarn } from "./logs.js";
-import { wrap } from "./prompt.js";
+import { wrap, chatPersona } from "./prompt.js";
 import { renderCompanionContext } from "./companioncontext.js";
 
 /**
@@ -240,7 +240,7 @@ export async function judgeWaitByLLM(config, role, user, history, scope, opts = 
         ? `${applyVars("{{user}}", vars)}的勿扰时段：${p.focus.start}-${p.focus.end}（这段时间里不要打扰）。`
         : "没有设勿扰时段。"
     ),
-    wrap("Character", applyVars(role?.description ?? "", vars)),
+    wrap("Character", applyVars(chatPersona(role), vars)),
     wrap("Chat_History", historyLines(recent, vars)),
   ]
     .filter(Boolean)
@@ -355,7 +355,7 @@ export async function judgeBusyByLLM(config, role, user, history, incoming, maxB
   const companion = renderCompanionContext(role?.id);
   const facts = [
     wrap("Now", nowLine()),
-    wrap("Character", applyVars(role?.description ?? "", vars)),
+    wrap("Character", applyVars(chatPersona(role), vars)),
     companion ? wrap("Companion", companion) : "",
     wrap("Chat_History", historyLines((history ?? []).slice(-10), vars)),
     wrap("Incoming", String(incoming ?? "").trim() || "（对方发了图片 / 语音之类，没有文字）"),

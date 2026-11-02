@@ -101,6 +101,15 @@ export function trimHistory(history, role, opts = {}) {
  * export 出去是给 memory.js 用的：三条总结链（记忆 / 备忘录 / 日记）的每一段
  * 也要 XML 包裹（用户的规范钉死的），包法必须和这里一模一样。
  */
+/**
+ * 聊天用的人设：写了「聊天角色提示词」就用它，没写就退回普通的角色提示词。
+ * 只给 iMessage 聊天这条线用（buildPrompt 的线上模式、主动消息的判断）。
+ */
+export function chatPersona(role) {
+  const chat = String(role?.chatDescription ?? "").trim();
+  return chat ? role.chatDescription : role?.description ?? "";
+}
+
 export function wrap(tag, body) {
   const text = String(body ?? "").trim();
   return text ? `<${tag}>\n${text}\n</${tag}>` : "";
@@ -830,7 +839,11 @@ export async function buildPrompt(config, role, user, history, weatherNote = "",
     switch (entry.kind) {
       case "char":
         // 人设原文直接注入。角色名要出现在提示词里就在正文里写 {{char}}
-        parts.push({ role: "system", content: wrap("Character", fill(role?.description)) });
+        // 线上（iMessage）用聊天专用人设，没写就退回普通人设；线下照旧用普通人设
+        parts.push({
+          role: "system",
+          content: wrap("Character", fill(offline ? role?.description : chatPersona(role))),
+        });
         break;
       case "user":
         parts.push({ role: "system", content: wrap("User", fill(user?.description)) });
