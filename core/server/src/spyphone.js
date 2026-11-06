@@ -72,6 +72,7 @@ const TRIGGER_BODY = "Screenshot request triggered.";
 export const LINE_TOKENS = {
   [TRIGGER_SUBJECT]: "⟡lets see⟡", // 看一眼当前手机屏幕
   ASTRBOT_OPEN_CHAT: "⟡come back⟡", // 回到当前聊天界面
+  ASTRBOT_LOCK: "⟡lock screen⟡", // 锁屏（锁屏状态下也能用，不需要解锁）
 };
 
 /** 收图路由的默认路径。改这个要和 iPhone 快捷指令里的 URL 一起改。 */
