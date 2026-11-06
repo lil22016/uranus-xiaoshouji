@@ -59,7 +59,7 @@ const TRIGGER_BODY = "Screenshot request triggered.";
  * 两件改成往对话里发一条暗号消息，让「收到含某串的消息」那条自动化来接。
  *
  * 代价是暗号会**实实在在出现在两人的对话气泡里**（邮件那套当初就是为了避开这点
- * 才用的）。所以暗号用一般打字打不出的 ⟡ 括起来 —— 角色正常对话里的 *动作* 星号
+ * 才用的）。所以暗号用一般打字打不出的 ✧ 括起来 —— 角色正常对话里的 *动作* 星号
  * 不会误触发。手机那边把自动化的「信息包含」填成和这里一模一样的串即可。
  *
  * 其余十几件事（看微信、账单、锁屏、放歌……）照旧走邮件：它们多是角色偶尔为之、
@@ -70,9 +70,9 @@ const TRIGGER_BODY = "Screenshot request triggered.";
  * sendLine 时，sendTriggerMail 自动回落到发邮件，老办法照样能用。
  */
 export const LINE_TOKENS = {
-  [TRIGGER_SUBJECT]: "⟡lets see⟡", // 看一眼当前手机屏幕
-  ASTRBOT_OPEN_CHAT: "⟡come back⟡", // 回到当前聊天界面
-  ASTRBOT_LOCK: "⟡lock screen⟡", // 锁屏（锁屏状态下也能用，不需要解锁）
+  [TRIGGER_SUBJECT]: "✧lets see✧", // 看一眼当前手机屏幕
+  ASTRBOT_OPEN_CHAT: "✧come back✧", // 回到当前聊天界面
+  ASTRBOT_LOCK: "✧lock screen✧", // 锁屏（锁屏状态下也能用，不需要解锁）
 };
 
 /** 收图路由的默认路径。改这个要和 iPhone 快捷指令里的 URL 一起改。 */
