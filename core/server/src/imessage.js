@@ -3054,6 +3054,22 @@ async function mcpRound(reply, toolCalls, { kit, eps, params, messages, scope, l
  *                     以及 `spyApi`（全局那份，手机那条腿的 SMTP 凭据）
  * @returns {Promise<string|null>} 第二次的回复原文；这轮不查岗时返回 null
  */
+/**
+ * 给 spyApi 挂一个 sendLine：把一条文本直接发进当前对话（走 iMessage 线路）。
+ *
+ * 「回到当前聊天界面」和「看一眼手机屏幕」这两件事改成发暗号消息、而不是触发邮件
+ * （见 spyphone.js:LINE_TOKENS 和 sendTriggerMail）—— iPhone 的「信息」自动化即时
+ * 触发、不受低电量模式影响，邮件在低电量下要等解锁或手动收信。暗号发哪条、长什么
+ * 样都在 spyphone.js 那张表里定；这里只负责趁手上还有 space 时把「发信的手」递过去。
+ *
+ * base 或 space 缺一个就原样返回（不挂 sendLine）—— sendTriggerMail 会自动回落到
+ * 发邮件，所以带外触发（手上没 space）那条路不受影响。
+ */
+function withSpyLine(base, space) {
+  if (!base || !space) return base;
+  return { ...base, sendLine: (text) => space.send(text) };
+}
+
 async function spyRound(
   reply,
   { role, eps, spyApi, params, messages, user, scope, llmScope, onPrompt }
@@ -3618,7 +3634,7 @@ async function handleTurn(
       role: freshRole,
       eps,
       // 全局那份：手机那条腿的 SMTP 凭据。用 freshConfig 和 freshRole 保持同一份快照
-      spyApi: freshConfig?.spyApi,
+      spyApi: withSpyLine(freshConfig?.spyApi, space),
       params,
       messages,
       user,
@@ -3644,7 +3660,7 @@ async function handleTurn(
     const phoned = await phoneRound(reply, {
       role: freshRole,
       eps,
-      spyApi: freshConfig?.spyApi,
+      spyApi: withSpyLine(freshConfig?.spyApi, space),
       params,
       messages,
       user,
@@ -4871,7 +4887,7 @@ async function runProactiveTurn(getConfig, runner, slot, spaceId, override = nul
     const spied = await spyRound(reply, {
       role,
       eps,
-      spyApi: config?.spyApi,
+      spyApi: withSpyLine(config?.spyApi, space),
       params,
       messages,
       user,
@@ -4892,7 +4908,7 @@ async function runProactiveTurn(getConfig, runner, slot, spaceId, override = nul
     const phoned = await phoneRound(reply, {
       role,
       eps,
-      spyApi: config?.spyApi,
+      spyApi: withSpyLine(config?.spyApi, space),
       params,
       messages,
       user,

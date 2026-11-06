@@ -50,6 +50,30 @@ export const TRIGGER_SUBJECT = "PHONESPY_TRIGGER";
 /** 触发邮件的正文。内容不重要，但不能为空 —— 有些 SMTP 会把空正文当垃圾邮件。 */
 const TRIGGER_BODY = "Screenshot request triggered.";
 
+/**
+ * 改走 iMessage（而不是触发邮件）的那几件事：主题 → 出现在对话气泡里的暗号。
+ *
+ * 为什么只有这两件：它们是用户在对话里即时用的 —— 「把我叫回聊天」「看一眼我
+ * 屏幕」。iPhone 的邮件自动化在低电量模式下**既不推送也不拉取**（要等解锁或手动
+ * 收信才到，常常晚几十分钟），而「信息」自动化不受低电量影响、即时触发。所以这
+ * 两件改成往对话里发一条暗号消息，让「收到含某串的消息」那条自动化来接。
+ *
+ * 代价是暗号会**实实在在出现在两人的对话气泡里**（邮件那套当初就是为了避开这点
+ * 才用的）。所以暗号用一般打字打不出的 ⟡ 括起来 —— 角色正常对话里的 *动作* 星号
+ * 不会误触发。手机那边把自动化的「信息包含」填成和这里一模一样的串即可。
+ *
+ * 其余十几件事（看微信、账单、锁屏、放歌……）照旧走邮件：它们多是角色偶尔为之、
+ * 不急在这一两分钟，也不值得为每件事在对话里留一条暗号。
+ *
+ * 发暗号靠 `api.sendLine(token)` —— 由消息循环在手上还有 space 时塞进 spyApi
+ * （见 imessage.js 的 withSpyLine）。带外触发（Companion、手上没 space）拿不到
+ * sendLine 时，sendTriggerMail 自动回落到发邮件，老办法照样能用。
+ */
+export const LINE_TOKENS = {
+  [TRIGGER_SUBJECT]: "⟡lets see⟡", // 看一眼当前手机屏幕
+  ASTRBOT_OPEN_CHAT: "⟡come back⟡", // 回到当前聊天界面
+};
+
 /** 收图路由的默认路径。改这个要和 iPhone 快捷指令里的 URL 一起改。 */
 export const DEFAULT_WEBHOOK_PATH = "/phone/screenshot";
 
@@ -276,6 +300,27 @@ export function phoneConfigProblem(api) {
  * @throws {Error} 发不出去（认证失败、连不上、超时）
  */
 export async function sendTriggerMail(api, opts = {}) {
+  const subject =
+    String(opts?.subject ?? "").trim() || String(api?.subject ?? "").trim() || TRIGGER_SUBJECT;
+
+  /*
+   * 改走 iMessage 的那两件事（见 LINE_TOKENS）：手上有 space（sendLine）时，
+   * 往对话里发一条暗号就完事，根本不碰 SMTP。发成了直接返回。
+   *
+   * sendLine 不在（带外触发、手上没 space）或者发失败，都**不报错**，而是落到
+   * 下面的邮件那条路 —— 老办法虽然慢，但带外场景下至少还能到。
+   */
+  const token = LINE_TOKENS[subject];
+  if (token && typeof api?.sendLine === "function") {
+    try {
+      await api.sendLine(token);
+      logInfo("查岗", `触发暗号已发进对话（${subject} → ${token}）`);
+      return;
+    } catch (e) {
+      logWarn("查岗", `暗号发不进对话，回落到触发邮件（${e?.message || e}）`);
+    }
+  }
+
   const port = Number(api?.smtpPort) || 587;
   const secure = port === 465;
 
@@ -289,8 +334,6 @@ export async function sendTriggerMail(api, opts = {}) {
     socketTimeout: SMTP_TIMEOUT,
   });
 
-  const subject =
-    String(opts?.subject ?? "").trim() || String(api?.subject ?? "").trim() || TRIGGER_SUBJECT;
   /*
    * 正文空着时填那句占位的话 —— 有些 SMTP 把空正文当垃圾邮件。给了参数的
    * 功能（闹钟、放歌）正文就是那个参数本身，快捷指令那边靠它干活。
