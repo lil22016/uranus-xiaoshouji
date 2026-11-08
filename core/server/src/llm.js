@@ -610,6 +610,24 @@ function describeNetworkError(e, timeout = REQUEST_TIMEOUT) {
 }
 
 /**
+ * 发给上游之前把「半个 emoji」去掉。
+ *
+ * 日记流水、记忆这些长文本会按字数截断，截断点偶尔正好落在一个 emoji 的两半中间
+ * （JS 字符串里 emoji 占两个 UTF-16 单元）。剩下的半个在 JSON 里会变成一个孤零零的
+ * \ud83d，DeepSeek 等用严格 JSON 解析的上游会直接 400：
+ * 「unexpected end of hex escape」。这里统一换成 U+FFFD，内容其它部分不动。
+ */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+export function wellFormed(v) {
+  if (typeof v !== "string") return v;
+  if (typeof v.toWellFormed === "function") return v.toWellFormed();
+  return v.replace(LONE_SURROGATE, "\uFFFD");
+}
+export function safeJson(body) {
+  return JSON.stringify(body, (_k, v) => wellFormed(v));
+}
+
+/**
  * 发一个 JSON 请求并把响应解析好。
  *
  * `headers` 给非 OpenAI 形状的接口用（Gemini 原生那条路要的是
@@ -633,7 +651,7 @@ async function requestJson(
       ...(body ? { "Content-Type": "application/json" } : {}),
       ...(key ? { Authorization: `Bearer ${key}` } : {}),
     },
-    body: body ? JSON.stringify(body) : undefined,
+    body: body ? safeJson(body) : undefined,
     signal: signal ? AbortSignal.any([timer, signal]) : timer,
   });
 
@@ -693,7 +711,7 @@ async function requestStream(
       // 有些反代靠这个头决定回不回 SSE
       Accept: "text/event-stream",
     },
-    body: JSON.stringify(body),
+    body: safeJson(body),
     signal: signal ? AbortSignal.any([timer, signal]) : timer,
   });
 
