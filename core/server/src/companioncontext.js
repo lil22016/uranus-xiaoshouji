@@ -42,6 +42,11 @@ export function appendCompanionContext(roleId, payload, maxChars = MAX_TOTAL_CHA
   const text = cleanText(payload?.text);
   if (!text) return readState(roleId);
   const state = readState(roleId), category = categoryFor(payload?.type);
+  // replace：同一来源只留最新一条（比如地图上「他现在在哪」、今天的专注总数）。
+  // 不然这类一天要更新好多次的状态会挤满 2800 字的额度，把别的背景（日记、你的近况）全挤掉，
+  // 他看到的「自己的生活」就只剩一串重复的地图记录。
+  const origin = String(payload?.origin || "");
+  if (payload?.replace && origin) for (const c of CATEGORIES) state[c] = (state[c] || []).filter(x => x.origin !== origin);
   state[category].push({
     id: String(payload?.id || crypto.randomUUID()), text,
     actor: String(payload?.actor || (category === "character_life" ? "character" : "user")),
