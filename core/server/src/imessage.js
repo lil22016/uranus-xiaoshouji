@@ -4715,6 +4715,25 @@ async function runProactiveTurn(getConfig, runner, slot, spaceId, override = nul
   }
 
   /*
+   * 把这个人还没过期的 tapback 兑现到这一轮主动消息里。
+   *
+   * 平时 tapback 只攒着、等对方下一条真消息一起送（takeReactHints）。可主动消息
+   * 是角色先开口，走不到那个兑现点 —— 于是「对方刚给你贴了个 🤤」角色看不到，
+   * 容易张口就当成「一直没回应」。这里在开口前把还新鲜的 reaction 读出来，缀在
+   * 提示词最前头，角色就能顺着它说话（「你就给我贴了个表情就没声了」）。
+   *
+   * 过期的（超过 BG_HINT_TTL_MS，约半小时）takeReactHints 已经清掉，取不到就是
+   * 空串，退回原来的「主动找你说话」。只在真·主动消息这一路兑现，override（定时
+   * 发帖之类）不碰，免得把 reaction 在无关的一轮里消耗掉。
+   */
+  const reactNote = override
+    ? ""
+    : applyVars(takeReactHints(runner, peerKeyOf(peer)).join("\n"), {
+        char: role?.name ?? "",
+        user: user?.name ?? "",
+      });
+
+  /*
    * 开了「主动发布帖子/快拍」的角色，这一轮多一个选项：把发帖的格式缀在
    * 提示词末尾，它可以选择发条动态而不是（或者不只是）来找人说话。
    *
@@ -4738,7 +4757,7 @@ async function runProactiveTurn(getConfig, runner, slot, spaceId, override = nul
       "不能沉默、不能输出 [leave_on_read]，也不要提到这条提示本身。）",
     { char: role?.name ?? "", user: user?.name ?? "" }
   );
-  const forModel = [toModel, composeNote, mustSend].filter(Boolean).join("\n\n");
+  const forModel = [reactNote, toModel, composeNote, mustSend].filter(Boolean).join("\n\n");
   if (composeNote) logDebug(scope, `${role.name} 这一轮可以顺手发条 Instagram`);
 
   logInfo(
@@ -4748,7 +4767,9 @@ async function runProactiveTurn(getConfig, runner, slot, spaceId, override = nul
 
   // 时间前缀和正常轮次同一个来路；天气照旧只进这一份提示词，不进存档
   const { time: timePrefix, weather: weatherNote } = await buildEnv(role, config.weatherApi);
-  const forHistory = timePrefix + toHistory;
+  // reaction 兑现了就把它留进历史（timePrefix + 「对方贴了…」+ 主动消息占位符），
+  // 这样后面几轮还记得「对方刚给你贴过表情」，不是只活在这一次请求里。
+  const forHistory = timePrefix + (reactNote ? reactNote + "\n" : "") + toHistory;
 
   /*
    * 发给模型的那一条 = 时间前缀 + 主动消息提示词（+ 可能缀上的发帖说明），
@@ -8071,6 +8092,19 @@ async function startRunner(getConfig, project, meta, retries = 0) {
                 scope,
                 `对方给${quoted ? `「${quoted}」` : "一条消息"}贴了 ${message.content.emoji ?? "?"}，先记下，等下条消息一起送`
               );
+              /*
+               * 贴 tapback 也算「对方有回应」：刷新沉默计时、重排下一条主动消息
+               * （和真消息进来时同一句 armProactive(replied)，见那一行）。
+               *
+               * 不这么做的话，沉默计时只认真正打字的消息，于是「对方刚给你贴了个
+               * 🤤」之后角色仍以为对方一直没理它，主动消息开口就是「都一小时没回了」。
+               * 贴表情是很轻的回应，仍然不当场回一轮（上面 noteReaction 已经把它
+               * 攒着了），但不该再被算成「已读没回/一直沉默」。
+               *
+               * 压在 reactSend.enabled 里：角色没开「消息回应」就对 tapback 完全无感，
+               * 那连计时也不该被它悄悄改动。
+               */
+              armProactive(getConfig, runner, spaceId, { space, peer, replied: true });
               continue;
             }
 
