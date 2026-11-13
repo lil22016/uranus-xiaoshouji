@@ -26,6 +26,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import jpeg from "jpeg-js";
 import { cafFormat, oggOpusToCaf, remuxCaf } from "./caf.js";
 
 // 只为了 formatAmount —— 退化成文字时那串金额要和卡片上显示的一模一样
@@ -1217,6 +1218,22 @@ const VISION_SHRINK_MIN = 700 * 1024;
 const VISION_MAX_SIDE = 1600;
 
 /**
+ * 纯 JS（jpeg-js）重编码时的 JPEG 质量，0–100。
+ *
+ * 省 token 靠的是缩**尺寸**（上面 VISION_MAX_SIDE），质量只管字节数 / 上传快慢。
+ * 75 在「图里的小字还认得清」和「别太大」之间取个平衡，和 ffmpeg 那路的 -q:v 4
+ * 差不多。
+ */
+const VISION_JPEG_QUALITY = 75;
+
+/**
+ * jpeg-js 解码时允许的内存上限（MB）。RGBA 要占 宽×高×4 字节，一张 12MP 的
+ * 手机照片≈48MB。卡在 128 是因为 Worker / Durable Object 的运行内存上限就是
+ * 128MB —— 超大图与其把整个 DO 撑爆，不如让 jpeg-js 直接拒绝、退回原图送。
+ */
+const VISION_DECODE_MAX_MB = 128;
+
+/**
  * 把**收到的**图片压小再送去识别。
  *
  * ── 为什么要压 ──
@@ -1247,9 +1264,17 @@ export async function shrinkForVision(buffer, { mimeType = "", name = "", scope 
   try {
     const bin = await ffmpegPath();
     if (!bin) {
+      /*
+       * Worker / 小手机后端里永远没有 ffmpeg（见本文件顶部、ffmpeg.js）。
+       * 这条路改用纯 JS 的 jpeg-js 解码→缩小→重编码，照样能把大图压小再送去
+       * 识别，省 token、也省上传时间。只认 JPEG（iMessage 照片的常见格式，
+       * 也是 jpeg-js 能解的）；PNG/WebP/HEIC 这些解不了，仍按原图送。
+       */
+      const pure = shrinkJpegPure(buffer, { name, scope });
+      if (pure) return pure;
       logWarn(
         scope,
-        `找不到 ffmpeg（静态包没装、PATH 上也没有），这张 ${kb(buffer.length)}KB 的图按原样送去识别，会慢一些`
+        `找不到 ffmpeg，这张 ${kb(buffer.length)}KB 的 ${sniffImage(buffer).ext} 图在本环境压不了（只有 JPEG 能纯 JS 压），按原样送去识别`
       );
       return fallback();
     }
@@ -1316,6 +1341,96 @@ export async function shrinkForVision(buffer, { mimeType = "", name = "", scope 
     logWarn(scope, "压图出错，按原图送去识别", String(e?.message ?? e));
     return fallback();
   }
+}
+
+/**
+ * 不靠 ffmpeg 把一张 JPEG 缩小 —— Worker 环境（没有 ffmpeg、起不了子进程）走这条。
+ *
+ * jpeg-js 解码成 RGBA → 面积平均缩到最长边 VISION_MAX_SIDE → 重新编码成 JPEG。
+ * 识图模型按**像素尺寸**计费，所以缩尺寸才真省 token（光压字节不算）。本来尺寸就
+ * 不大的（最长边已 ≤ 上限）只重编码压字节、尺寸不动。压完反而更大就退回原图。
+ *
+ * 只收 JPEG：别的格式 jpeg-js 解不了，返回 null 让调用方按原图送。解码 / 编码任何
+ * 一步抛了也返回 null —— 省 token 是锦上添花，不值得为它把识别整挂了。
+ *
+ * @returns {{buffer:Buffer, mimeType:string}|null}
+ */
+function shrinkJpegPure(buffer, { name = "", scope } = {}) {
+  if (sniffImageType(buffer)?.mimeType !== "image/jpeg") return null;
+  const kb = (n) => (n / 1024).toFixed(0);
+  try {
+    const img = jpeg.decode(buffer, {
+      useTArray: true,
+      formatAsRGBA: true,
+      maxMemoryUsageInMB: VISION_DECODE_MAX_MB,
+    });
+    const { width: sw, height: sh, data: src } = img;
+    if (!sw || !sh || !src?.length) return null;
+
+    const scale = Math.min(1, VISION_MAX_SIDE / Math.max(sw, sh));
+    const dw = Math.max(1, Math.round(sw * scale));
+    const dh = Math.max(1, Math.round(sh * scale));
+    const data = scale < 1 ? areaResizeRGBA(src, sw, sh, dw, dh) : src;
+
+    const out = Buffer.from(jpeg.encode({ data, width: dw, height: dh }, VISION_JPEG_QUALITY).data);
+    // 压完反而更大（本来就压得很狠的 JPEG）就别用，省得白掉质量还涨字节
+    if (out.length >= buffer.length) {
+      logDebug(scope, `这张图压完反而更大（${kb(buffer.length)}KB → ${kb(out.length)}KB），按原图送`);
+      return null;
+    }
+    logInfo(
+      scope,
+      `图片压小${name ? `「${name}」` : ""}（纯 JS）：${sw}×${sh} ${kb(buffer.length)}KB → ` +
+        `${dw}×${dh} ${kb(out.length)}KB（省了 ${Math.round((1 - out.length / buffer.length) * 100)}%）`
+    );
+    return { buffer: out, mimeType: "image/jpeg" };
+  } catch (e) {
+    logWarn(scope, "纯 JS 压图失败，按原图送去识别", String(e?.message ?? e));
+    return null;
+  }
+}
+
+/**
+ * 面积平均把 RGBA 缩小：每个目标像素取它覆盖的那块源像素的平均色。缩小时比最近邻
+ * 清楚得多（尤其图里有字时），每个源像素只读一次，够快。只用于缩小（dw≤sw、dh≤sh）。
+ *
+ * @param {Uint8Array} src 源 RGBA（长 sw*sh*4）
+ * @returns {Uint8Array} 目标 RGBA（长 dw*dh*4）
+ */
+function areaResizeRGBA(src, sw, sh, dw, dh) {
+  const dst = new Uint8Array(dw * dh * 4);
+  const xr = sw / dw;
+  const yr = sh / dh;
+  for (let dy = 0; dy < dh; dy++) {
+    const sy0 = Math.floor(dy * yr);
+    const sy1 = Math.max(sy0 + 1, Math.min(sh, Math.floor((dy + 1) * yr)));
+    for (let dx = 0; dx < dw; dx++) {
+      const sx0 = Math.floor(dx * xr);
+      const sx1 = Math.max(sx0 + 1, Math.min(sw, Math.floor((dx + 1) * xr)));
+      let r = 0;
+      let g = 0;
+      let b = 0;
+      let a = 0;
+      let cnt = 0;
+      for (let sy = sy0; sy < sy1; sy++) {
+        let si = (sy * sw + sx0) * 4;
+        for (let sx = sx0; sx < sx1; sx++) {
+          r += src[si];
+          g += src[si + 1];
+          b += src[si + 2];
+          a += src[si + 3];
+          si += 4;
+          cnt++;
+        }
+      }
+      const di = (dy * dw + dx) * 4;
+      dst[di] = (r / cnt) | 0;
+      dst[di + 1] = (g / cnt) | 0;
+      dst[di + 2] = (b / cnt) | 0;
+      dst[di + 3] = (a / cnt) | 0;
+    }
+  }
+  return dst;
 }
 
 /** 上游错误体截一段出来，别把整页 HTML 灌进日志。 */
