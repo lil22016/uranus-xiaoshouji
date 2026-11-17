@@ -1294,6 +1294,39 @@ function chain(runner, spaceId, task, what) {
  *   文本、图片附件、或语音附件（三选一）
  * @param {string} [peer] 对方地址（E.164 手机号或邮箱），用来算会话 ID
  */
+/*
+ * 一条消息在途超过这么久，才值得专门提醒模型「这是迟到的、别当成现在」。
+ * 比日志那条 30s 的线（见 dateCreated/isDelayed 那段）高得多：日常几十秒的网络
+ * 抖动当成「现在」没问题，只有明显迟到才会误导角色。
+ */
+const STALE_NOTICE_MS = 15 * 60 * 1000;
+
+/**
+ * 一条消息迟到太久才送达时，给模型的一句提示。没迟到、或只差一两分钟的返回空串，
+ * 不打扰正常聊天。
+ *
+ * 为什么需要：收消息走 iMessage。对方手机没网 / 低电量时，这条会压在发件箱里，
+ * 等手机重新上线才真正送出来 —— 实机见过压了一整天的（比如地理围栏自动化在
+ * 「到家」时发的那条，隔了二十来小时才到）。送到时 `dateCreated` 仍是当初那一刻，
+ * 模型要是不知道，就会把「我刚到家」当成此刻发生，甚至据此以为对方现在在某地。
+ * 在途时长本来就算过（见 dateCreated/isDelayed 那段），只是当时只写进了日志。
+ *
+ * @returns {string} 系统提示，或空串
+ */
+function staleNotice(message) {
+  const bornAt = message?.dateCreated ? new Date(message.dateCreated).getTime() : 0;
+  if (!bornAt) return "";
+  const lag = Date.now() - bornAt;
+  if (lag < STALE_NOTICE_MS) return "";
+  const mins = Math.round(lag / 60000);
+  const ago = mins >= 120 ? `约 ${Math.round(mins / 60)} 小时前` : `约 ${mins} 分钟前`;
+  return (
+    `[系统提示:这条消息其实是${ago}发出的，因为网络或推送延迟、刚刚才送达，` +
+    `不是此刻发生的。如果里面说「刚到家 / 正在 / 现在」之类，按它发出的时间理解，` +
+    `别当成当下，也别据此以为对方此刻就在某地。]`
+  );
+}
+
 export function enqueue(getConfig, runner, space, spaceId, item, peer = "") {
   const waitSec = Number(getConfig().chat?.queueWait);
   const wait = Number.isFinite(waitSec) && waitSec > 0 ? waitSec : 0;
@@ -1303,7 +1336,11 @@ export function enqueue(getConfig, runner, space, spaceId, item, peer = "") {
     { texts: [], images: [], voices: [], videos: [], timer: null, space, peer };
   slot.space = space; // 同一会话可能拿到新的 space 实例，用最新的
   if (peer) slot.peer = peer;
-  if (item?.text) slot.texts.push(item.text);
+  // 迟到太久才送达的消息，贴一句「这是旧的、别当成现在」缀在它前头（见 staleNotice）。
+  // 没迟到就是空串、什么都不加。附件（图/语音/视频）没有正文时，单独记这一句。
+  const staleTag = item?.message ? staleNotice(item.message) : "";
+  if (item?.text) slot.texts.push(staleTag ? `${staleTag}\n${item.text}` : item.text);
+  else if (staleTag) slot.texts.push(staleTag);
   if (item?.image) slot.images.push(item.image);
   // 老的 slot 可能是这版代码之前建的，没有 voices / videos 字段
   if (item?.voice) (slot.voices ??= []).push(item.voice);
