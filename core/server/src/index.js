@@ -3222,8 +3222,13 @@ app.post("/api/memories/:key/generate/:kind", async (req, res) => {
   const run = runners[kind];
   if (!run) return res.status(400).json({ ok: false, error: "只能生成 memory / memo / diary" });
 
+  // 日记可以指定写哪一天（补写昨天之类）；不传就和以前一样按流水最后一条算
+  const date = kind === "diary" ? String(req.body?.date ?? "").trim() : "";
+  if (date && (!/^\d{4}-\d{2}-\d{2}$/.test(date) || date > localDate())) {
+    return res.status(400).json({ ok: false, error: "日期得是 YYYY-MM-DD，而且不能是以后的日子" });
+  }
   try {
-    const out = await run(ctx.config, ctx.role);
+    const out = await run(ctx.config, ctx.role, date ? { date } : undefined);
     if (out.log) logInfo("记忆库", out.log);
     res.json({ ...out, ok: Boolean(out.ok), stats: statsFor(ctx.key) });
   } catch (e) {

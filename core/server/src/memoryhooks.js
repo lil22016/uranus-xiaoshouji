@@ -27,12 +27,14 @@ import {
   diaryLogLine,
   diaryWeather,
   generateDiary,
+  splitDiaryLogByDay,
   summarizeMemo,
   summarizeMemory,
 } from "./memory.js";
 import {
   appendDiaryLine,
   appendPending,
+  localDate,
   markFail,
   memoryKeyFor,
   readDiaryLog,
@@ -342,7 +344,8 @@ async function manualSummary(kind, config, role) {
  * 天气**现查**（「什么时候生成的日记就注入什么时间的天气」），查不到就整段
  * 不注入 —— `diaryWeather` 已经把错误折成空串了。
  */
-export async function manualDiary(config, role) {
+export async function manualDiary(config, role, opts = {}) {
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(String(opts.date ?? "")) ? opts.date : "";
   const key = memoryKeyFor(role);
   const cfg = config?.memories?.diary ?? {};
   if (!gatesOf(role).diary) {
@@ -357,13 +360,17 @@ export async function manualDiary(config, role) {
   if (!readDiaryLog(key).trim()) {
     return { ok: false, text: "日记流水是空的，这段时间没有聊天记录可写。" };
   }
+  if (date && !splitDiaryLogByDay(readDiaryLog(key), date).upTo.trim()) {
+    return { ok: false, text: `流水里没有 ${date} 及以前的聊天（可能已经写进日记了）。` };
+  }
 
   const lock = `diary:${key}`;
   if (running.has(lock)) return { ok: false, text: "日记正在写，稍等一下。" };
   running.add(lock);
   try {
-    const weather = await diaryWeather(config, role);
-    const out = await generateDiary(config, role, key, { weather });
+    // 补写过去的某一天：现在的天气不是那天的，干脆不给
+    const weather = date && date !== localDate() ? "" : await diaryWeather(config, role);
+    const out = await generateDiary(config, role, key, { weather, date });
     markDiaryDone(key);
     return {
       ok: true,

@@ -39,6 +39,7 @@ import {
   readPending,
   readRecentDiaries,
   writeDiary,
+  writeDiaryLog,
   writeMemo,
 } from "./memorystore.js";
 /*
@@ -1074,9 +1075,12 @@ export function buildDiaryMessages(config, role, key, opts = {}) {
  */
 export async function generateDiary(config, role, key, opts = {}) {
   const cfg = config?.memories?.diary ?? {};
-  const now = opts.now ?? new Date();
-  const log = readDiaryLog(key);
-  if (!log.trim()) throw new Error("日记流水是空的，这段时间没有聊天记录");
+  // 指定了日期（「补写某一天」）：只拿流水里这天及以前的部分来写，日记记在这天，
+  // 「近 N 天」也按这天往前数；之后的流水原样留着，等下一篇
+  const pickDate = /^\d{4}-\d{2}-\d{2}$/.test(String(opts.date ?? "")) ? opts.date : "";
+  const now = opts.now ?? (pickDate ? endOfDay(pickDate) : new Date());
+  const log = pickDate ? splitDiaryLogByDay(readDiaryLog(key), pickDate).upTo : readDiaryLog(key);
+  if (!log.trim()) throw new Error(pickDate ? `流水里没有 ${pickDate} 及以前的聊天（可能已经写进日记了）` : "日记流水是空的，这段时间没有聊天记录");
 
   const endpoint = chainEndpoint(config, cfg.model, "生成日记");
   const messages = buildDiaryMessages(config, role, key, { ...opts, now, log });
@@ -1146,14 +1150,52 @@ export async function generateDiary(config, role, key, opts = {}) {
     );
   }
 
-  const file = writeDiary(key, diaryDayOf(log, now), text);
+  const file = writeDiary(key, pickDate || diaryDayOf(log, now), text);
   // 写成了才清流水，而且清之前先备份。上面任何一条 throw 都走不到这里
-  commitDiaryLog(key);
+  if (pickDate) {
+    // 补写某一天：整份备份 + 清空之后，把这天以后的部分写回去。
+    // 重新读一遍流水 —— 写日记那几十秒里新聊的也要留住
+    const rest = splitDiaryLogByDay(readDiaryLog(key), pickDate).rest;
+    commitDiaryLog(key);
+    if (rest.trim()) writeDiaryLog(key, rest);
+  } else {
+    commitDiaryLog(key);
+  }
   logInfo(
     "记忆库",
     `${key} 生成了一篇日记 ${file}（正文 ${diaryLength(text, lang)} ${unit}，全文 ${text.length} 个字符，打了 ${Math.min(tries + 1, maxTries)} 次）`
   );
   return { file, text, tries: Math.min(tries + 1, maxTries) };
+}
+
+/** `YYYY-MM-DD` 那天的 23:59（本地时间）。 */
+function endOfDay(date) {
+  const [y, m, d] = date.split("-").map(Number);
+  return new Date(y, m - 1, d, 23, 59, 0);
+}
+
+/**
+ * 按「属于哪一天」切开流水：`upTo` = 这天及以前，`rest` = 这天以后。
+ *
+ * 流水一条消息以 `YYYY-MM-DD 星期 HH:MM` 开头，后面不带日期的行是同一条的续行。
+ * 「属于哪一天」和 diaryDayOf 同一个规矩：凌晨 05:00 前的算前一天。
+ * 开头没带日期的那几行跟着第一段走（算进 upTo）。
+ */
+export function splitDiaryLogByDay(log, date) {
+  const upTo = [];
+  const rest = [];
+  let into = upTo;
+  for (const line of String(log ?? "").split(/\r?\n/)) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})\s+\S+\s+(\d{2}):\d{2}/.exec(line.trim());
+    if (m) {
+      const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+      if (Number(m[4]) < 5) d.setDate(d.getDate() - 1);
+      into = localDate(d) <= date ? upTo : rest;
+    }
+    into.push(line);
+  }
+  const join = (a) => a.join("\n").replace(/\s+$/, "");
+  return { upTo: join(upTo), rest: join(rest) };
 }
 
 /**
