@@ -1092,6 +1092,21 @@ app.put("/api/config", async (req, res) => {
   res.json(saved);
 });
 
+/**
+ * 只读 / 只改「暂停回复」这一个开关（给 Companion 的「一键切换」用）。
+ * 不走整份 PUT /api/config：那条路要把整份配置读出来再写回去，容易误伤别的设置。
+ */
+app.get("/api/chat/pause", (_req, res) => {
+  res.json({ ok: true, paused: Boolean(loadConfig()?.chat?.pauseReply) });
+});
+app.post("/api/chat/pause", (req, res) => {
+  const paused = Boolean(req.body?.paused);
+  const cfg = loadConfig();
+  saveConfig({ ...cfg, chat: { ...(cfg.chat || {}), pauseReply: paused } });
+  logInfo("配置", paused ? "「暂停回复」已打开（从 Companion 切换）" : "「暂停回复」已关闭（从 Companion 切换）");
+  res.json({ ok: true, paused: Boolean(loadConfig()?.chat?.pauseReply) });
+});
+
 app.get("/api/config/path", (_req, res) => {
   res.json({ path: getConfigPath(), dataDir: getDataDir() });
 });
