@@ -424,6 +424,12 @@ export const DEFAULT_CONFIG = {
     separator: "$", // 气泡分隔符
     // 强制分隔：不认 $，改按逗号句号换行空格切。和 separator 是互斥的两条路
     forceSeparator: false,
+    /*
+     * 暂停回复：打开后 iMessage 收到的消息一律不处理（不调模型、不回、不记进记忆），
+     * 主动消息也不发。号码、角色、记忆、其他功能全部保留，关掉就恢复。
+     * 用在「这阵子不用 iMessage 聊了」的时候（比如改去拾心界聊）。
+     */
+    pauseReply: false,
     queueWait: 8, // 收到消息后合并等待时间（秒）
     /*
      * 晚一点回：合并窗口到点后，再随机晚 minMinutes~maxMinutes 分钟才开始回。
@@ -3220,6 +3226,7 @@ export function normalizeConfig(input) {
       separator: input.chat.separator ?? base.chat.separator,
       // 认布尔，也认它的字符串形态（手机上改过、或从 JSON 捞回来的）
       forceSeparator: [true, "true", 1, "1"].includes(input.chat.forceSeparator),
+      pauseReply: [true, "true", 1, "1"].includes(input.chat.pauseReply),
       queueWait:
         typeof input.chat.queueWait === "number"
           ? input.chat.queueWait

@@ -4493,6 +4493,13 @@ async function fireProactive(getConfig, runner, spaceId) {
   const slot = runner.proactive.get(spaceId);
   if (!slot) return;
 
+  // 暂停回复期间主动消息也不发；关掉暂停后下一轮照常排
+  if (config?.chat?.pauseReply) {
+    logInfo(scope, "「暂停回复」开着，这条主动消息不发");
+    disarmProactive(runner, spaceId);
+    return;
+  }
+
   if (!p?.enabled) {
     disarmProactive(runner, spaceId);
     return;
@@ -7964,6 +7971,18 @@ async function startRunner(getConfig, project, meta, retries = 0) {
               continue; // 非当前 provider
             }
             if (message.id && runner.seen.has(message.id)) continue; // 去重
+
+            /*
+             * 暂停回复：控制台「暂停回复」开着时，收到什么都不处理。
+             * 已读回执不打日志（太频繁），其他消息记一行，免得以为是没收到。
+             */
+            if (getConfig()?.chat?.pauseReply) {
+              if (message.id) noteSeen(runner, message.id);
+              if (message?.content?.type !== "read") {
+                logInfo(scope, "「暂停回复」开着，这条消息不处理（在控制台关掉暂停就恢复）");
+              }
+              continue;
+            }
 
             const spaceId = message.space?.id ?? message.sender?.id ?? "unknown";
             // 对方的规范地址（E.164 手机号或 iMessage 邮箱）。会话 ID 拿它当后缀
